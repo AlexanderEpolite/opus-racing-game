@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Sunset Ridge GP</title>
+<link rel="stylesheet" href="./styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏁</text></svg>">
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js"
+  }
+}
+</script>
+</head>
+<body>
+
+<div id="app">
+  <canvas id="scene"></canvas>
+
+  <!-- ===================== In-race HUD ===================== -->
+  <div id="hud" hidden>
+    <div class="corner top-left">
+      <div id="place" class="place">
+        <span id="place-num">1</span><span id="place-suffix">st</span>
+      </div>
+      <div class="lap-box">
+        <span class="label">LAP</span>
+        <span id="lap-num">1</span><span class="slash">/</span><span id="lap-total">3</span>
+      </div>
+      <div id="race-time" class="race-time">0:00.00</div>
+    </div>
+
+    <div class="corner top-right">
+      <div id="item-slot" class="item-slot empty">
+        <div id="item-icon" class="item-icon"></div>
+      </div>
+      <div id="item-name" class="item-name"></div>
+    </div>
+
+    <div class="corner bottom-left">
+      <canvas id="minimap" width="240" height="240"></canvas>
+    </div>
+
+    <div class="corner bottom-right">
+      <div class="speedo">
+        <svg viewBox="0 0 120 120" class="speedo-svg">
+          <path class="speedo-track" d="M 18 96 A 52 52 0 1 1 102 96" />
+          <path id="speedo-fill" class="speedo-fill" d="M 18 96 A 52 52 0 1 1 102 96" />
+        </svg>
+        <div class="speedo-readout">
+          <span id="speed-num">0</span>
+          <span class="speedo-unit">km/h</span>
+        </div>
+        <div id="gear-badge" class="gear-badge"></div>
+      </div>
+    </div>
+
+    <div id="standings" class="standings"></div>
+
+    <div id="center-msg" class="center-msg"></div>
+    <div id="countdown" class="countdown"></div>
+    <div id="screen-tint" class="screen-tint"></div>
+    <div id="speed-lines" class="speed-lines"></div>
+  </div>
+
+  <!-- ===================== Touch controls ===================== -->
+  <div id="touch-controls" hidden>
+    <div class="touch-cluster left">
+      <button id="touch-left" class="tbtn">◀</button>
+      <button id="touch-right" class="tbtn">▶</button>
+    </div>
+    <div class="touch-cluster right">
+      <button id="touch-item" class="tbtn small">ITEM</button>
+      <button id="touch-drift" class="tbtn small">DRIFT</button>
+      <button id="touch-brake" class="tbtn small">BRAKE</button>
+      <button id="touch-accel" class="tbtn accel">GO</button>
+    </div>
+  </div>
+
+  <!-- ===================== Start screen ===================== -->
+  <div id="start-screen" class="overlay">
+    <div class="panel">
+      <div class="eyebrow">3 LAPS &middot; 8 RACERS</div>
+      <h1 class="title">SUNSET<span>RIDGE</span>GP</h1>
+      <p class="tagline">Climb the ridge, launch the canyon, glide for the landing.</p>
+
+      <div class="controls-grid">
+        <div class="ctrl"><kbd>W</kbd><kbd>↑</kbd><span>Accelerate</span></div>
+        <div class="ctrl"><kbd>S</kbd><kbd>↓</kbd><span>Brake / reverse</span></div>
+        <div class="ctrl"><kbd>A</kbd><kbd>D</kbd><span>Steer</span></div>
+        <div class="ctrl"><kbd>Space</kbd><span>Hop &amp; drift &rarr; mini-turbo</span></div>
+        <div class="ctrl"><kbd>E</kbd><span>Use item</span></div>
+        <div class="ctrl"><kbd>C</kbd><span>Look behind</span></div>
+        <div class="ctrl"><kbd>R</kbd><span>Respawn</span></div>
+        <div class="ctrl"><kbd>P</kbd><span>Pause &middot; <kbd>M</kbd> mute</span></div>
+      </div>
+
+      <div class="hint-row">
+        <div class="hint"><b>Drift</b> — hold <kbd>Space</kbd> through a corner while steering. Sparks go
+          blue → orange → violet; let go for a boost.</div>
+        <div class="hint"><b>Glide</b> — after a big ramp your wing opens. <kbd>S</kbd> floats,
+          <kbd>W</kbd> dives for speed.</div>
+      </div>
+
+      <button id="start-btn" class="cta">START RACE</button>
+      <div class="fineprint">Gamepad supported &middot; <span id="loading-note">building circuit…</span></div>
+    </div>
+  </div>
+
+  <!-- ===================== Pause ===================== -->
+  <div id="pause-screen" class="overlay" hidden>
+    <div class="panel small">
+      <h2>PAUSED</h2>
+      <button id="resume-btn" class="cta">RESUME</button>
+      <button id="restart-btn" class="cta ghost">RESTART RACE</button>
+    </div>
+  </div>
+
+  <!-- ===================== Results ===================== -->
+  <div id="results-screen" class="overlay" hidden>
+    <div class="panel">
+      <h2 id="results-title">FINISH</h2>
+      <div id="results-list" class="results-list"></div>
+      <button id="again-btn" class="cta">RACE AGAIN</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>
