@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "python3 -m http.server 8080",
-    "serve": "npx --yes serve -l 8080 ."
+    "serve": "npx --yes serve -l 8080 .",
+    "server": "bun run server/server.ts",
+    "server:node": "node --experimental-strip-types server/server.ts"
   }
 }

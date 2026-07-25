@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { KART, RACE } from './config.js';
+import { KART } from './config.js';
 import { makeKart, makeNameTag } from './models.js';
 
 /**
@@ -20,6 +20,7 @@ const KERB_WIDTH = 1.2;
 
 const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
+const _v3 = new THREE.Vector3();
 const _q1 = new THREE.Quaternion();
 const _m1 = new THREE.Matrix4();
 
@@ -54,6 +55,25 @@ export class Kart {
     this.place = index + 1;
     this.finished = false;
     this.finishTime = 0;
+
+    // --- Progress policing ---
+    // Every checkpoint has to be swept past in order before the line counts, and
+    // recorded distance can never run ahead of "laps actually completed plus
+    // where you are right now". Together these mean no amount of leaving the
+    // course can buy a metre of progress.
+    this.cpHit = new Uint8Array(this.track.checkpoints.length);
+    this.crossings = 0;
+
+    // --- Networking (remote karts are driven by their owner's client) ---
+    this.remote = false;
+    this.netSlot = index;
+    this.net = {
+      position: new THREE.Vector3(),
+      velocity: new THREE.Vector3(),
+      yaw: 0,
+      age: 0,
+      valid: false,
+    };
 
     // --- Drift / boost ---
     this.driftDir = 0;
@@ -119,16 +139,36 @@ export class Kart {
     this.prevS = s;
     if (!keepDistance) {
       // Grid slots sit behind the line, so lap 1 completes on the first crossing.
-      this.distance = s > this.track.length * 0.5 ? s - this.track.length : s;
+      this.distance = this.track.distanceAt(s);
+      this.resetProgress(s);
     }
     this.cancelDrift();
     this.syncModel(0);
   }
 
+  /**
+   * Arm the checkpoint sequence for a kart sitting on the grid. Everything the
+   * kart has already driven past counts as visited, so the first crossing of the
+   * line is the start of lap 1 rather than a rejected lap.
+   */
+  resetProgress(s) {
+    const cps = this.track.checkpoints;
+    if (this.cpHit.length !== cps.length) this.cpHit = new Uint8Array(cps.length);
+    this.cpHit.fill(0);
+    this.crossings = 0;
+    if (this.track.closed) {
+      for (let i = 1; i < cps.length; i++) this.cpHit[i] = cps[i] <= s ? 1 : 0;
+    }
+  }
+
   // ----------------------------------------------------------------- update
 
   update(dt, input) {
-    if (this.finished) input = EMPTY_INPUT;
+    if (this.remote) {
+      this.updateRemote(dt);
+      return;
+    }
+    if (this.finished) input = this.finishedInput();
 
     this.hitFlash = Math.max(0, this.hitFlash - dt * 3);
     this.shieldTimer = Math.max(0, this.shieldTimer - dt);
@@ -169,6 +209,15 @@ export class Kart {
     this.checkFall();
     this.advanceDistance();
     this.syncModel(dt);
+  }
+
+  /**
+   * A kart that has taken the flag coasts to a stop. On a sprint that matters:
+   * there is only so much run-off past the line before the road runs out.
+   */
+  finishedInput() {
+    if (this.track.closed) return EMPTY_INPUT;
+    return { throttle: 0, brake: 1, steer: 0, drift: false, useItem: false, lookBack: false };
   }
 
   project() {
@@ -531,15 +580,23 @@ export class Kart {
     this.game.onLand?.(this, impact);
   }
 
+  /**
+   * Barriers on the ground, an invisible corridor in the air.
+   *
+   * Karts used to be allowed to sail straight over the barriers on a big jump.
+   * That turned the glider into a shortcut tool: leave the course sideways, come
+   * down on a section a third of a lap further on, and keep the distance. Now a
+   * flight is confined to a slightly wider version of the same tube it launched
+   * from -- you can still fly wherever the course goes, just not off it.
+   */
   resolveWalls(dt) {
-    const limit = this.track.wallLimit(this.proj.halfWidth);
+    const inGap = this.track.inGap(this.proj.s);
+    const airborne = !this.grounded;
+    const limit = airborne
+      ? this.track.airLimit(this.proj.halfWidth, inGap)
+      : this.track.wallLimit(this.proj.halfWidth);
     const lat = this.proj.lateral;
     if (Math.abs(lat) <= limit) return;
-
-    // You can clear the barriers on a big jump; otherwise they hold you in.
-    const inGap = this.track.inGap(this.proj.s);
-    if (inGap) return;
-    if (!this.grounded && this.proj.height > 2.6) return;
 
     const over = Math.abs(lat) - limit;
     const dir = Math.sign(lat);
@@ -548,13 +605,19 @@ export class Kart {
 
     const vSide = this.velocity.dot(frame.right);
     if (vSide * dir > 0) {
-      this.velocity.addScaledVector(frame.right, -vSide * 1.25);
-      const fwd = this.forward;
-      const vf = this.velocity.dot(fwd);
-      this.velocity.copy(fwd).multiplyScalar(vf * 0.86);
-      if (Math.abs(vSide) > 6) this.game.onWallHit?.(this, Math.abs(vSide));
+      if (airborne) {
+        // Nothing to bounce off up here: just kill the outward drift so the
+        // flight continues down the course instead of away from it.
+        this.velocity.addScaledVector(frame.right, -vSide);
+      } else {
+        this.velocity.addScaledVector(frame.right, -vSide * 1.25);
+        const fwd = this.forward;
+        const vf = this.velocity.dot(fwd);
+        this.velocity.copy(fwd).multiplyScalar(vf * 0.86);
+        if (Math.abs(vSide) > 6) this.game.onWallHit?.(this, Math.abs(vSide));
+      }
     }
-    this.cancelDrift();
+    if (!airborne) this.cancelDrift();
   }
 
   checkFall() {
@@ -567,6 +630,7 @@ export class Kart {
 
   startRespawn() {
     this.respawnTimer = KART.respawnDuration;
+    this.respawnFromS = this.proj.s;
     this.respawnTarget = this.track.respawnPoint(this.proj.s);
     this.velocity.set(0, 0, 0);
     this.gliding = false;
@@ -593,6 +657,9 @@ export class Kart {
       this.respawnTimer = 0;
       this.grounded = true;
       this.invulnTimer = 1.4;
+      // The tow truck may have dropped the kart past a gap it fell into. Credit
+      // the checkpoints it was carried over -- it already paid for them in time.
+      this.sweepCheckpoints(this.respawnFromS ?? this.respawnTarget, this.respawnTarget);
       this.prevS = this.respawnTarget;
       this.project();
     }
@@ -650,22 +717,87 @@ export class Kart {
   // ------------------------------------------------------------------- laps
 
   advanceDistance() {
-    const ds = this.track.wrapDelta(this.proj.s - this.prevS);
+    const track = this.track;
+    const ds = track.wrapDelta(this.proj.s - this.prevS);
     // Ignore teleport-sized jumps (respawns, projection snapping across a gap).
-    if (Math.abs(ds) < this.track.length * 0.2) this.distance += ds;
+    if (Math.abs(ds) < track.length * 0.2) {
+      this.distance += ds;
+      this.sweepCheckpoints(this.prevS, this.proj.s);
+    }
     this.prevS = this.proj.s;
 
+    // Hard ceiling on progress: laps genuinely completed, plus however far
+    // along the current lap the kart actually is. Anything that gets a kart
+    // further down the road without driving it (a glide over the scenery, a
+    // projection that snaps to a deck below) buys nothing.
+    if (track.closed) {
+      const ceiling = (this.crossings - 1) * track.length + this.proj.s + 6;
+      if (this.distance > ceiling) this.distance = ceiling;
+    } else if (this.distance > this.proj.s + 6) {
+      this.distance = this.proj.s + 6;
+    }
+
     const lap = THREE.MathUtils.clamp(
-      Math.floor(this.distance / this.track.length) + 1, 1, RACE.laps
+      Math.floor(this.distance / track.length) + 1, 1, track.laps
     );
     if (lap > this.lap) this.game.onLap?.(this, lap);
     this.lap = lap;
 
-    if (!this.finished && this.distance >= this.track.length * RACE.laps) {
+    if (!this.finished && this.distance >= track.raceDistance && this.progressComplete()) {
       this.finished = true;
       this.finishTime = this.game.raceTime;
       this.game.onFinish?.(this);
     }
+  }
+
+  /** Has this kart legitimately been everywhere the race requires? */
+  progressComplete() {
+    if (this.track.closed) return this.crossings >= this.track.laps + 1;
+    for (let i = 0; i < this.cpHit.length; i++) if (!this.cpHit[i]) return false;
+    return true;
+  }
+
+  /**
+   * Tick off every checkpoint swept between two positions on the centreline.
+   * Reversing back over one un-ticks it again, so spinning around and crossing
+   * the line the wrong way puts a kart properly back on the previous lap rather
+   * than costing it one.
+   */
+  sweepCheckpoints(fromS, toS) {
+    const track = this.track;
+    const cps = track.checkpoints;
+    const delta = track.wrapDelta(toS - fromS);
+    if (delta === 0 || Math.abs(delta) > track.length * 0.2) return;
+    for (let i = 0; i < cps.length; i++) {
+      const d = track.wrapDelta(cps[i] - fromS);
+      const swept = delta > 0 ? d > 0 && d <= delta : d <= 0 && d > delta;
+      if (!swept) continue;
+      if (track.closed && i === 0) {
+        if (delta > 0) this.crossLine();
+        else this.uncrossLine();
+      } else {
+        this.cpHit[i] = delta > 0 ? 1 : 0;
+      }
+    }
+  }
+
+  /** Crossing the start/finish line only counts a lap if the lap was driven. */
+  crossLine() {
+    for (let i = 1; i < this.cpHit.length; i++) {
+      if (!this.cpHit[i]) {
+        this.game.onMissedCheckpoint?.(this);
+        return;
+      }
+    }
+    this.crossings++;
+    this.cpHit.fill(0);
+  }
+
+  /** Backing over the line: hand the previous lap's checkpoints back. */
+  uncrossLine() {
+    if (this.crossings <= 0) return;
+    this.crossings--;
+    this.cpHit.fill(1);
   }
 
   // --------------------------------------------------------------- visuals
@@ -828,7 +960,125 @@ export class Kart {
     }
   }
 
+  // ------------------------------------------------------------ networking
+
+  /**
+   * Compact state for the wire. Clients are trusted, so a kart's owner is the
+   * only authority on where it is -- everyone else just plays back what arrives.
+   */
+  toNetState() {
+    const flags =
+      (this.grounded ? 1 : 0) |
+      (this.driftActive ? 2 : 0) |
+      (this.gliding ? 4 : 0) |
+      (this.offroad ? 8 : 0) |
+      (this.finished ? 16 : 0) |
+      (this.driftDir > 0 ? 32 : 0) |
+      (this.driftDir < 0 ? 64 : 0);
+    const r = (v) => Math.round(v * 100) / 100;
+    return [
+      this.netSlot,
+      r(this.position.x), r(this.position.y), r(this.position.z),
+      r(this.yaw),
+      r(this.velocity.x), r(this.velocity.y), r(this.velocity.z),
+      flags,
+      Math.round(this.distance * 10) / 10,
+      this.lap,
+      r(this.boostTimer), r(this.shieldTimer), r(this.spinTimer), r(this.squashTimer),
+      r(this.finishTime),
+    ];
+  }
+
+  applyNetState(a) {
+    const n = this.net;
+    n.position.set(a[1], a[2], a[3]);
+    n.yaw = a[4];
+    n.velocity.set(a[5], a[6], a[7]);
+    n.age = 0;
+    if (!n.valid) {
+      // First packet: snap rather than sliding in from wherever we started.
+      n.valid = true;
+      this.position.copy(n.position);
+      this.yaw = n.yaw;
+      this.velocity.copy(n.velocity);
+      this.hint = this.track.indexAt(0);
+      this.project();
+    }
+    const flags = a[8];
+    this.grounded = !!(flags & 1);
+    this.driftActive = !!(flags & 2);
+    this.gliding = !!(flags & 4);
+    this.offroad = !!(flags & 8);
+    this.driftDir = flags & 32 ? 1 : flags & 64 ? -1 : 0;
+    this.distance = a[9];
+    this.lap = a[10];
+    this.boostTimer = a[11];
+    this.shieldTimer = a[12];
+    this.spinTimer = a[13];
+    this.squashTimer = a[14];
+    this.finishTime = a[15];
+    if (flags & 16) this.finished = true;
+  }
+
+  /**
+   * Rebuild the checkpoint bookkeeping from a distance that arrived over the
+   * wire. Used when a client inherits a kart somebody else was simulating: the
+   * previous owner already policed its progress, so we trust the number and
+   * carry on from wherever it says the kart is.
+   */
+  syncProgressFromDistance() {
+    const track = this.track;
+    const cps = track.checkpoints;
+    if (track.closed) {
+      this.crossings = Math.max(0, Math.floor(this.distance / track.length) + 1);
+      this.cpHit[0] = 1;
+      for (let i = 1; i < cps.length; i++) this.cpHit[i] = cps[i] <= this.proj.s ? 1 : 0;
+    } else {
+      for (let i = 0; i < cps.length; i++) this.cpHit[i] = cps[i] <= this.proj.s ? 1 : 0;
+    }
+    this.prevS = this.proj.s;
+  }
+
+  updateRemote(dt) {
+    const n = this.net;
+    if (n.valid) {
+      n.age += dt;
+      // Extrapolate from the last packet, then chase the result. 20 Hz of
+      // updates plus a little dead reckoning is plenty for karts you are only
+      // ever looking at from the outside.
+      _v3.copy(n.position).addScaledVector(n.velocity, Math.min(n.age, 0.4));
+      const k = 1 - Math.exp(-14 * dt);
+      this.position.lerp(_v3, k);
+      this.velocity.lerp(n.velocity, k);
+      let d = n.yaw - this.yaw;
+      while (d > Math.PI) d -= Math.PI * 2;
+      while (d < -Math.PI) d += Math.PI * 2;
+      this.yaw += d * k;
+    }
+
+    this.boostTimer = Math.max(0, this.boostTimer - dt);
+    this.shieldTimer = Math.max(0, this.shieldTimer - dt);
+    this.spinTimer = Math.max(0, this.spinTimer - dt);
+    this.squashTimer = Math.max(0, this.squashTimer - dt);
+    this.empTimer = Math.max(0, this.empTimer - dt);
+    this.hitFlash = Math.max(0, this.hitFlash - dt * 3);
+
+    this.project();
+    if (this.proj.frame) this.surfaceNormal.copy(this.proj.frame.normal);
+    this.gliderBlend = this.gliding
+      ? Math.min(1, this.gliderBlend + dt * 5)
+      : Math.max(0, this.gliderBlend - dt * 6);
+    this.syncModel(dt);
+  }
+
   dispose() {
     this.game.scene.remove(this.model);
+    this.model.traverse((node) => {
+      node.geometry?.dispose?.();
+      const mat = node.material;
+      if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+      else mat?.dispose?.();
+    });
+    this.tag.material.map?.dispose();
   }
 }

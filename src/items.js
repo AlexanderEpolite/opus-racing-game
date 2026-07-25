@@ -32,6 +32,19 @@ export class ItemSystem {
     }
   }
 
+  /** Tear everything down when the circuit changes. */
+  dispose() {
+    this.reset();
+    for (const box of this.boxes) {
+      this.game.scene.remove(box.mesh);
+      box.mesh.traverse((node) => {
+        node.geometry?.dispose?.();
+        node.material?.dispose?.();
+      });
+    }
+    this.boxes.length = 0;
+  }
+
   reset() {
     for (const box of this.boxes) {
       box.active = true;
@@ -78,14 +91,19 @@ export class ItemSystem {
 
   checkPickups() {
     for (const kart of this.game.karts) {
+      // Remote karts take their crates on their own client and tell us about
+      // it; picking up on their behalf here would empty the road twice over.
+      if (kart.remote) continue;
       if (kart.item || kart.itemRoulette > 0 || kart.isStunned) continue;
-      for (const box of this.boxes) {
+      for (let i = 0; i < this.boxes.length; i++) {
+        const box = this.boxes[i];
         if (!box.active) continue;
         if (kart.position.distanceToSquared(box.mesh.position) > 9) continue;
         box.active = false;
         box.mesh.visible = false;
         box.respawn = ITEMS.boxRespawn;
         this.grant(kart);
+        this.game.onBoxTaken?.(kart, i);
         this.game.particles.burst(box.mesh.position, 22, this.game.colors.pickup, {
           speed: 9, size: 0.55, life: 0.55, gravity: 4,
         });
@@ -150,6 +168,43 @@ export class ItemSystem {
     this.game.onItemUsed?.(kart, item);
   }
 
+  /**
+   * Replay an item another player used. Every client simulates every hazard and
+   * projectile, but only ever applies damage to the karts it owns -- see
+   * `updateHazards` and `stepRocket` -- so no hit messages are needed.
+   */
+  useRemote(kart, item) {
+    switch (item) {
+      case 'slick':
+        this.dropSlick(kart);
+        break;
+      case 'bomb':
+        this.fireBomb(kart);
+        break;
+      case 'rocket':
+        this.fireRocket(kart);
+        break;
+      case 'emp':
+        this.firePulse(kart);
+        break;
+      default:
+        // Boosts and shields show up in the owner's broadcast state.
+        break;
+    }
+  }
+
+  /** A crate somebody else drove through. */
+  takeBox(index) {
+    const box = this.boxes[index];
+    if (!box || !box.active) return;
+    box.active = false;
+    box.mesh.visible = false;
+    box.respawn = ITEMS.boxRespawn;
+    this.game.particles.burst(box.mesh.position, 22, this.game.colors.pickup, {
+      speed: 9, size: 0.55, life: 0.55, gravity: 4,
+    });
+  }
+
   dropSlick(kart) {
     const mesh = makeSlick();
     const s = this.track.wrap(kart.proj.s - 5);
@@ -199,7 +254,9 @@ export class ItemSystem {
     for (const other of this.game.karts) {
       if (other === kart) continue;
       if (other.distance <= kart.distance) continue;
-      if (other.zap(ITEMS.empSlowDuration)) {
+      // Remote karts get zapped by their own client, which is running this same
+      // pulse; here we just draw the sparks.
+      if (other.remote || other.zap(ITEMS.empSlowDuration)) {
         hits++;
         this.game.particles.burst(other.position, 18, this.game.colors.emp, {
           speed: 7, size: 0.6, life: 0.7, up: 3,
@@ -230,7 +287,7 @@ export class ItemSystem {
         if (kart.isStunned) continue;
         if (kart.position.distanceToSquared(h.mesh.position) > 6.5) continue;
         if (!kart.grounded && kart.proj.height > 2) continue;
-        if (kart.spinOut(1)) {
+        if (!kart.remote && kart.spinOut(1)) {
           this.game.particles.burst(kart.position, 20, this.game.colors.smoke, {
             speed: 6, size: 0.8, life: 0.8, up: 2,
           });
@@ -291,6 +348,7 @@ export class ItemSystem {
     for (const kart of this.game.karts) {
       if (kart === p.owner) continue;
       if (kart.position.distanceToSquared(p.mesh.position) > 12) continue;
+      if (kart.remote) return true;   // their client is running this rocket too
       if (kart.spinOut(1.2)) {
         this.explode(kart.position, 5, false);
         return true;
@@ -349,7 +407,7 @@ export class ItemSystem {
     if (!damaging) return;
     const r2 = radius * radius;
     for (const kart of g.karts) {
-      if (kart === owner) continue;
+      if (kart === owner || kart.remote) continue;
       if (kart.position.distanceToSquared(position) > r2) continue;
       kart.squashed();
     }

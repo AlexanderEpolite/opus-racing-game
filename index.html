@@ -30,6 +30,7 @@
         <span id="lap-num">1</span><span class="slash">/</span><span id="lap-total">3</span>
       </div>
       <div id="race-time" class="race-time">0:00.00</div>
+      <div id="track-name" class="track-name"></div>
     </div>
 
     <div class="corner top-right">
@@ -81,10 +82,12 @@
 
   <!-- ===================== Start screen ===================== -->
   <div id="start-screen" class="overlay">
-    <div class="panel">
-      <div class="eyebrow">3 LAPS &middot; 8 RACERS</div>
+    <div class="panel wide">
+      <div class="eyebrow">4 CIRCUITS &middot; 8 RACERS &middot; ONLINE</div>
       <h1 class="title">SUNSET<span>RIDGE</span>GP</h1>
-      <p class="tagline">Climb the ridge, launch the canyon, glide for the landing.</p>
+      <p class="tagline" id="track-blurb">Climb the ridge, launch the canyon, glide for the landing.</p>
+
+      <div id="track-grid" class="track-grid"></div>
 
       <div class="controls-grid">
         <div class="ctrl"><kbd>W</kbd><kbd>↑</kbd><span>Accelerate</span></div>
@@ -104,8 +107,72 @@
           <kbd>W</kbd> dives for speed.</div>
       </div>
 
-      <button id="start-btn" class="cta">START RACE</button>
+      <div class="button-row">
+        <button id="start-btn" class="cta">START RACE</button>
+        <button id="mp-btn" class="cta ghost">MULTIPLAYER</button>
+      </div>
       <div class="fineprint">Gamepad supported &middot; <span id="loading-note">building circuit…</span></div>
+    </div>
+  </div>
+
+  <!-- ===================== Multiplayer entry ===================== -->
+  <div id="mp-screen" class="overlay" hidden>
+    <div class="panel">
+      <div class="eyebrow">ONLINE</div>
+      <h2>MULTIPLAYER</h2>
+      <p class="tagline">Host a room and share the code, or join one you were given.</p>
+
+      <label class="field">
+        <span>YOUR NAME</span>
+        <input id="mp-name" type="text" maxlength="12" autocomplete="off" spellcheck="false" value="PLAYER">
+      </label>
+
+      <button id="mp-host" class="cta">HOST A ROOM</button>
+
+      <div class="join-row">
+        <input id="mp-code" type="text" maxlength="4" autocomplete="off" spellcheck="false" placeholder="CODE">
+        <button id="mp-join" class="cta ghost">JOIN</button>
+      </div>
+
+      <div id="mp-status" class="mp-status"></div>
+      <button id="mp-back" class="cta ghost small">BACK</button>
+    </div>
+  </div>
+
+  <!-- ===================== Lobby ===================== -->
+  <div id="lobby-screen" class="overlay" hidden>
+    <div class="panel wide">
+      <div class="eyebrow">ROOM CODE</div>
+      <div id="lobby-code" class="room-code">····</div>
+
+      <div class="lobby-cols">
+        <div class="lobby-col">
+          <h3>RACERS <span id="lobby-count" class="dim"></span></h3>
+          <div id="lobby-players" class="lobby-players"></div>
+        </div>
+        <div class="lobby-col">
+          <h3>CIRCUIT</h3>
+          <div id="lobby-tracks" class="track-grid compact"></div>
+          <p id="lobby-track-note" class="fineprint">Only the host can change the circuit.</p>
+        </div>
+      </div>
+
+      <div class="button-row">
+        <button id="lobby-ready" class="cta ghost">READY</button>
+        <button id="lobby-start" class="cta" hidden>START RACE</button>
+        <button id="lobby-leave" class="cta ghost">LEAVE ROOM</button>
+      </div>
+      <div id="lobby-status" class="fineprint"></div>
+    </div>
+  </div>
+
+  <!-- ===================== Loading ===================== -->
+  <div id="loading-screen" class="overlay" hidden>
+    <div class="panel small">
+      <div class="eyebrow" id="loading-kind">CIRCUIT</div>
+      <h2 id="loading-title">LOADING</h2>
+      <div class="loading-bar"><div id="loading-fill"></div></div>
+      <p class="fineprint" id="loading-text">building…</p>
     </div>
   </div>
 
@@ -115,6 +182,7 @@
       <h2>PAUSED</h2>
       <button id="resume-btn" class="cta">RESUME</button>
       <button id="restart-btn" class="cta ghost">RESTART RACE</button>
+      <button id="quit-btn" class="cta ghost">QUIT TO MENU</button>
     </div>
   </div>
 
@@ -123,7 +191,11 @@
     <div class="panel">
       <h2 id="results-title">FINISH</h2>
       <div id="results-list" class="results-list"></div>
-      <button id="again-btn" class="cta">RACE AGAIN</button>
+      <div id="results-note" class="fineprint"></div>
+      <div class="button-row">
+        <button id="again-btn" class="cta">RACE AGAIN</button>
+        <button id="results-menu-btn" class="cta ghost">MENU</button>
+      </div>
     </div>
   </div>
 </div>

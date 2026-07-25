@@ -32,8 +32,15 @@ export class Input {
 
     this.onAction = null;   // pause / restart / mute hooks
 
+    // Menus have text fields in them; a driving control scheme that eats every
+    // W and S would make the name box unusable.
+    const typing = (e) => {
+      const el = e.target;
+      return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+    };
+
     target.addEventListener('keydown', (e) => {
-      if (e.repeat) return;
+      if (e.repeat || typing(e)) return;
       const name = KEY_MAP[e.code];
       if (name) {
         this.keys.add(name);
@@ -48,6 +55,7 @@ export class Input {
     });
 
     target.addEventListener('keyup', (e) => {
+      if (typing(e)) return;
       const name = KEY_MAP[e.code];
       if (name) {
         this.keys.delete(name);

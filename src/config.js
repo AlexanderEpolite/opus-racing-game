@@ -4,9 +4,16 @@
  */
 
 export const RACE = {
-  laps: 3,
+  laps: 3,                // overwritten per track when a circuit is loaded
   racerCount: 8,
   countdownSeconds: 3.6,
+};
+
+/** Multiplayer transport. */
+export const NET = {
+  url: 'wss://co5-game-ws.epolite.net/',
+  sendHz: 20,             // kart state broadcasts per second
+  timeout: 12000,         // give up on a silent socket after this long
 };
 
 export const KART = {
@@ -67,6 +74,31 @@ export const KART = {
   spinSpeedMul: 0.28,
   squashDuration: 1.5,
   respawnDuration: 1.6,
+};
+
+/**
+ * Circuits may reshape the handling model -- ice is slithery, a long descent
+ * wants a taller top gear. `applyHandling` is called once per track load and
+ * always starts from the untouched baseline above.
+ */
+const KART_BASE = { ...KART };
+
+export function applyHandling(overrides = {}) {
+  for (const key of Object.keys(KART)) {
+    if (!(key in KART_BASE)) delete KART[key];
+  }
+  Object.assign(KART, KART_BASE, overrides);
+}
+
+/**
+ * How far a kart may stray sideways from the centreline while airborne, on top
+ * of the barrier line. Karts used to be able to sail clean over the barriers on
+ * a big jump and drop onto a completely different part of the circuit; the
+ * corridor keeps a flight inside the course it was launched from.
+ */
+export const CORRIDOR = {
+  airMargin: 1.4,         // extra metres beyond the barriers while flying
+  gapMargin: 5.0,         // ...and while crossing a gap, where there are none
 };
 
 export const CAMERA = {

@@ -42,8 +42,12 @@ export class AIDriver {
     const input = this.input;
     input.useItem = false;
 
-    if (game.state !== 'racing' || kart.finished) {
-      input.throttle = game.state === 'racing' ? 1 : 0;
+    // The board comes up as soon as *you* take the flag, but the rest of the
+    // field is still racing for the remaining places -- and in multiplayer they
+    // are being watched by everyone who has not finished yet.
+    const running = game.state === 'racing' || game.state === 'results';
+    if (!running || kart.finished) {
+      input.throttle = running ? 1 : 0;
       input.brake = 0;
       input.steer = 0;
       input.drift = false;

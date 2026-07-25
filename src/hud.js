@@ -1,4 +1,4 @@
-import { RACE, KART } from './config.js';
+import { KART } from './config.js';
 import { itemDisplayName } from './items.js';
 
 /** Screen furniture: readouts, minimap, messaging and the results board. */
@@ -68,6 +68,9 @@ export class HUD {
       speedo: root.querySelector('.speedo'),
       gearBadge: root.getElementById('gear-badge'),
       minimap: root.getElementById('minimap'),
+      lapLabel: root.querySelector('.lap-box .label'),
+      lapSlash: root.querySelector('.lap-box .slash'),
+      trackName: root.getElementById('track-name'),
       standings: root.getElementById('standings'),
       centerMsg: root.getElementById('center-msg'),
       countdown: root.getElementById('countdown'),
@@ -78,7 +81,6 @@ export class HUD {
       resultsTitle: root.getElementById('results-title'),
     };
 
-    this.el.lapTotal.textContent = RACE.laps;
     this.ctx = this.el.minimap.getContext('2d');
     this.msgTimer = 0;
     this.hurtTimer = 0;
@@ -86,6 +88,20 @@ export class HUD {
     this.rouletteFace = 0;
     this.rows = [];
 
+    this.bindTrack();
+  }
+
+  /** Re-point the HUD at whatever circuit is currently loaded. */
+  bindTrack() {
+    const track = this.game.track;
+    this.sprint = !track.closed;
+    this.el.lapTotal.textContent = track.laps;
+    this.el.lapLabel.textContent = this.sprint ? 'RUN' : 'LAP';
+    this.el.lapTotal.hidden = this.sprint;
+    this.el.lapSlash.hidden = this.sprint;
+    if (this.el.trackName) this.el.trackName.textContent = track.name;
+    this.shownItem = undefined;
+    this.rows = [];
     this._prepareMinimap();
     this._buildStandings();
   }
@@ -116,7 +132,8 @@ export class HUD {
     // Pre-split the centreline into solid runs so gaps show as breaks.
     const runs = [];
     let run = [];
-    for (let i = 0; i <= track.sampleCount; i++) {
+    const last = track.closed ? track.sampleCount : track.sampleCount - 1;
+    for (let i = 0; i <= last; i++) {
       const idx = i % track.sampleCount;
       if (track.isGapSample[idx]) {
         if (run.length > 1) runs.push(run);
@@ -152,20 +169,26 @@ export class HUD {
       }
     }
 
-    // Start/finish tick.
+    // Start (and, on a sprint, finish) ticks.
     const track = this.game.track;
-    const f = track.frameAt(0);
-    const a = f.position.clone().addScaledVector(f.right, -f.halfWidth);
-    const b = f.position.clone().addScaledVector(f.right, f.halfWidth);
-    ctx.strokeStyle = '#ffd23f';
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.moveTo(toX(a.x), toY(a.z));
-    ctx.lineTo(toX(b.x), toY(b.z));
-    ctx.stroke();
+    const tick = (s, color) => {
+      const f = track.frameAt(s);
+      const a = f.position.clone().addScaledVector(f.right, -f.halfWidth);
+      const b = f.position.clone().addScaledVector(f.right, f.halfWidth);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(toX(a.x), toY(a.z));
+      ctx.lineTo(toX(b.x), toY(b.z));
+      ctx.stroke();
+    };
+    tick(track.startLineS, '#ffd23f');
+    if (!track.closed) tick(track.finishS, '#7cf07c');
 
     // Racers, player last so it sits on top.
-    const ordered = [...this.game.karts].sort((p, q) => (p.isPlayer ? 1 : 0) - (q.isPlayer ? 1 : 0));
+    const ordered = [...this.game.karts]
+      .filter((k) => !k.left)
+      .sort((p, q) => (p.isPlayer ? 1 : 0) - (q.isPlayer ? 1 : 0));
     for (const kart of ordered) {
       const x = toX(kart.position.x);
       const y = toY(kart.position.z);
@@ -201,9 +224,12 @@ export class HUD {
   }
 
   drawStandings(order) {
+    // A player who quits mid-race leaves a hole in the order.
+    for (let i = order.length; i < this.rows.length; i++) this.rows[i].row.hidden = true;
     for (let i = 0; i < order.length; i++) {
       const kart = order[i];
       const r = this.rows[i];
+      r.row.hidden = false;
       r.n.textContent = i + 1;
       r.dot.style.background = '#' + kart.color.getHexString();
       r.name.textContent = kart.def.name;
@@ -286,11 +312,21 @@ export class HUD {
     const player = this.game.player;
 
     // Position + lap.
+    const track = this.game.track;
     const place = order.indexOf(player) + 1;
     this.el.placeNum.textContent = place;
     this.el.placeSuffix.textContent = ordinal(place);
-    this.el.lapNum.textContent = player.lap;
-    this.el.lapBox.classList.toggle('final', player.lap === RACE.laps && !player.finished);
+    if (this.sprint) {
+      // No laps to count on a point-to-point run, so show how much is left.
+      const done = Math.max(0, player.distance - track.startLineS);
+      const total = Math.max(1, track.raceDistance - track.startLineS);
+      const pct = Math.min(100, Math.round((done / total) * 100));
+      this.el.lapNum.textContent = `${pct}%`;
+      this.el.lapBox.classList.toggle('final', pct >= 80 && !player.finished);
+    } else {
+      this.el.lapNum.textContent = player.lap;
+      this.el.lapBox.classList.toggle('final', player.lap === track.laps && !player.finished);
+    }
     this.el.raceTime.textContent = formatTime(this.game.raceTime);
 
     // Speed.
@@ -327,10 +363,17 @@ export class HUD {
 
   // --------------------------------------------------------------- results
 
-  showResults(order) {
+  showResults(order, networked = false) {
     const list = this.el.resultsList;
     list.innerHTML = '';
     const playerPlace = order.indexOf(this.game.player) + 1;
+
+    const again = document.getElementById('again-btn');
+    const menu = document.getElementById('results-menu-btn');
+    const note = document.getElementById('results-note');
+    if (again) again.hidden = networked;
+    if (menu) menu.textContent = networked ? 'BACK TO LOBBY' : 'MENU';
+    if (note) note.textContent = networked ? 'The rest of the field is still out there.' : '';
     this.el.resultsTitle.textContent =
       playerPlace === 1 ? 'WINNER!' : `${playerPlace}${ordinal(playerPlace)} PLACE`;
 

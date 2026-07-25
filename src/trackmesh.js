@@ -5,10 +5,13 @@ import * as TX from './textures.js';
  * Turns the abstract Track into geometry.
  *
  * Everything is built as "strips" that run along the centreline: the road, its
- * kerbs, the dirt run-off, the barriers, and the underside of the deck. A strip
- * is defined by two edges, each of which is a (lateral, height) offset from the
- * banked centreline frame -- that one primitive covers flat surfaces and vertical
- * walls alike.
+ * kerbs, the run-off, the barriers, and the underside of the deck. A strip is
+ * defined by two edges, each of which is a (lateral, height) offset from the
+ * banked centreline frame -- that one primitive covers flat surfaces and
+ * vertical walls alike.
+ *
+ * Colours and textures come from the track's theme, so the same code paves
+ * asphalt, ice and basalt.
  */
 
 const KERB_WIDTH = 1.2;
@@ -26,13 +29,16 @@ const RAIL_TOP = 1.45;
 function buildStrip(track, edgeA, edgeB, opts = {}) {
   const { vScale = 12, skipGaps = true } = opts;
   const n = track.sampleCount;
+  // A circuit needs one extra ring so the loop closes with continuous UVs; a
+  // sprint must *not* have one, or the finish would be stitched to the grid.
+  const rings = track.closed ? n + 1 : n;
+  const segments = track.closed ? n : n - 1;
   const frame = track.frameAt(0);
   const positions = [];
   const uvs = [];
   const indices = [];
 
-  // One extra ring so the loop closes with continuous UVs.
-  for (let i = 0; i <= n; i++) {
+  for (let i = 0; i < rings; i++) {
     const s = i * track.sampleSpacing;
     track.frameAt(s, frame);
     const hw = frame.halfWidth;
@@ -46,8 +52,8 @@ function buildStrip(track, edgeA, edgeB, opts = {}) {
     uvs.push(0, s / vScale, 1, s / vScale);
   }
 
-  const solid = (i) => !skipGaps || !track.isGapSample[i % n];
-  for (let i = 0; i < n; i++) {
+  const solid = (i) => !skipGaps || !track.isGapSample[track.clampIndex(i)];
+  for (let i = 0; i < segments; i++) {
     if (!solid(i) || !solid(i + 1)) continue;
     const a = i * 2;
     indices.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
@@ -65,11 +71,12 @@ function buildStrip(track, edgeA, edgeB, opts = {}) {
 function findGapEdges(track) {
   const n = track.sampleCount;
   const edges = [];
-  for (let i = 0; i < n; i++) {
+  const last = track.closed ? n : n - 1;
+  for (let i = 0; i < last; i++) {
     const here = !track.isGapSample[i];
-    const next = !track.isGapSample[(i + 1) % n];
+    const next = !track.isGapSample[track.clampIndex(i + 1)];
     if (here && !next) edges.push({ index: i, facing: 1 });
-    if (!here && next) edges.push({ index: (i + 1) % n, facing: -1 });
+    if (!here && next) edges.push({ index: track.clampIndex(i + 1), facing: -1 });
   }
   return edges;
 }
@@ -84,20 +91,24 @@ function makeMesh(geo, material, name) {
 }
 
 export function buildTrackMesh(track) {
+  const theme = track.theme;
   const group = new THREE.Group();
   group.name = 'circuit';
 
-  const roadTex = TX.roadTexture();
+  const roadTex = TX.roadTexture(theme);
   roadTex.repeat.set(1, 1);
-  const kerbTex = TX.kerbTexture();
-  const dirtTex = TX.shoulderTexture();
+  const kerbTex = TX.kerbTexture(theme);
+  const dirtTex = TX.shoulderTexture(theme);
 
   const roadMat = new THREE.MeshStandardMaterial({ map: roadTex, roughness: 0.92, metalness: 0.02 });
   const kerbMat = new THREE.MeshStandardMaterial({ map: kerbTex, roughness: 0.6 });
   const dirtMat = new THREE.MeshStandardMaterial({ map: dirtTex, roughness: 1.0 });
-  const deckMat = new THREE.MeshStandardMaterial({ color: 0x4a4a55, roughness: 0.95 });
+  const deckMat = new THREE.MeshStandardMaterial({ color: theme.deck.color, roughness: 0.95 });
   const railMat = new THREE.MeshStandardMaterial({
-    color: 0xd7dbe4, roughness: 0.35, metalness: 0.75, side: THREE.DoubleSide,
+    color: theme.rail.color,
+    roughness: theme.rail.roughness ?? 0.35,
+    metalness: theme.rail.metalness ?? 0.75,
+    side: THREE.DoubleSide,
   });
 
   const shoulder = track.shoulderWidth();
@@ -123,7 +134,7 @@ export function buildTrackMesh(track) {
     ));
   }
 
-  // --- Dirt run-off -------------------------------------------------------
+  // --- Run-off ------------------------------------------------------------
   for (const side of [-1, 1]) {
     group.add(makeMesh(
       buildStrip(
@@ -178,9 +189,13 @@ export function buildTrackMesh(track) {
   const boostPads = buildBoostPads(track);
   group.add(boostPads.group);
 
-  group.add(buildFinishLine(track));
-  const gantry = buildStartGantry(track);
-  group.add(gantry);
+  // --- Start / finish furniture -------------------------------------------
+  group.add(buildLine(track, track.startLineS, 'startLine'));
+  group.add(buildGantry(track, track.startLineS, theme.gantry.title, theme.gantry.tint));
+  if (!track.closed) {
+    group.add(buildLine(track, track.finishS, 'finishLine'));
+    group.add(buildGantry(track, track.finishS, 'FINISH', theme.gantry.tint));
+  }
   group.add(buildBanners(track, wall));
 
   group.updateMatrixWorld(true);
@@ -193,7 +208,9 @@ function buildRailPosts(track, wall) {
   const count = Math.floor(track.length / spacing);
   const geo = new THREE.CylinderGeometry(0.11, 0.13, RAIL_TOP + 0.3, 6);
   geo.translate(0, (RAIL_TOP + 0.3) / 2 - 0.2, 0);
-  const mat = new THREE.MeshStandardMaterial({ color: 0x8b90a0, roughness: 0.5, metalness: 0.7 });
+  const mat = new THREE.MeshStandardMaterial({
+    color: track.theme.rail.color, roughness: 0.5, metalness: 0.6,
+  });
 
   const slots = [];
   const frame = track.frameAt(0);
@@ -284,11 +301,13 @@ function buildBoostPads(track) {
   return { group, pads };
 }
 
-function buildFinishLine(track) {
-  const frame = track.frameAt(0);
+function buildLine(track, s, name) {
+  const frame = track.frameAt(s);
   const tex = TX.checkerTexture();
-  tex.repeat.set(10, 2);
-  const mat = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.7 });
+  const mat = new THREE.MeshStandardMaterial({ map: tex.clone(), roughness: 0.7 });
+  mat.map.wrapS = mat.map.wrapT = THREE.RepeatWrapping;
+  mat.map.repeat.set(10, 2);
+  mat.map.needsUpdate = true;
   const geo = new THREE.PlaneGeometry(frame.halfWidth * 2, 4);
   const mesh = new THREE.Mesh(geo, mat);
   mesh.position.copy(frame.position).addScaledVector(frame.normal, 0.045);
@@ -296,14 +315,14 @@ function buildFinishLine(track) {
   mesh.quaternion.setFromRotationMatrix(m);
   mesh.rotateX(-Math.PI / 2);
   mesh.receiveShadow = true;
-  mesh.name = 'finishLine';
+  mesh.name = name;
   return mesh;
 }
 
-function buildStartGantry(track) {
+function buildGantry(track, s, title, tint) {
   const group = new THREE.Group();
   group.name = 'gantry';
-  const frame = track.frameAt(0);
+  const frame = track.frameAt(s);
   const hw = frame.halfWidth;
 
   const legMat = new THREE.MeshStandardMaterial({ color: 0x2a2f3d, roughness: 0.5, metalness: 0.5 });
@@ -330,16 +349,16 @@ function buildStartGantry(track) {
   canvas.height = 128;
   const ctx = canvas.getContext('2d');
   const grad = ctx.createLinearGradient(0, 0, 1024, 0);
-  grad.addColorStop(0, '#ff6b3d');
-  grad.addColorStop(0.5, '#ffd23f');
-  grad.addColorStop(1, '#35d1ff');
+  grad.addColorStop(0, tint[0]);
+  grad.addColorStop(0.5, tint[1]);
+  grad.addColorStop(1, tint[2]);
   ctx.fillStyle = '#0e1119';
   ctx.fillRect(0, 0, 1024, 128);
   ctx.fillStyle = grad;
   ctx.font = 'bold 74px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText('SUNSET RIDGE GP', 512, 68);
+  ctx.fillText(title, 512, 68);
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
   const panel = new THREE.Mesh(
@@ -430,7 +449,7 @@ function buildBanners(track, wall) {
 
   group.add(toMesh(
     front,
-    new THREE.MeshStandardMaterial({ map: TX.bannerTexture(), roughness: 0.85 }),
+    new THREE.MeshStandardMaterial({ map: TX.bannerTexture(track.theme), roughness: 0.85 }),
     'bannerFronts'
   ));
   group.add(toMesh(

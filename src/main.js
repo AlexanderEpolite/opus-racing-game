@@ -1,5 +1,6 @@
 import * as THREE from 'three';
-import { RACE, CAMERA, KART, RACERS, AI_PROFILES } from './config.js';
+import { RACE, CAMERA, KART, NET, RACERS, AI_PROFILES, applyHandling } from './config.js';
+import { TRACKS, DEFAULT_TRACK, trackById } from './tracks/index.js';
 import { Track } from './track.js';
 import { buildTrackMesh } from './trackmesh.js';
 import { World } from './world.js';
@@ -10,14 +11,19 @@ import { Particles } from './models.js';
 import { Input } from './input.js';
 import { HUD } from './hud.js';
 import { Audio } from './audio.js';
+import { Menu } from './lobby.js';
 
 const MAX_STEP = 1 / 30;   // never integrate a step bigger than this
 const _v = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
 
+/** Items that put something into the world and therefore have to be replicated. */
+const REPLICATED_ITEMS = new Set(['slick', 'bomb', 'rocket', 'emp']);
+
 class Game {
   constructor() {
     this.state = 'loading';
+    this.mode = 'solo';
     this.elapsed = 0;
     this.raceTime = 0;
     this.countdown = RACE.countdownSeconds;
@@ -25,6 +31,10 @@ class Game {
     this.cameraShake = 0;
     this.throttleHeld = 0;
     this.resultsShown = false;
+    this.overlayPaused = false;
+    this.netAccum = 0;
+    this.net = null;
+    this.trackId = null;
 
     this.colors = {
       driftDust: new THREE.Color(0xbfb49a),
@@ -77,7 +87,7 @@ class Game {
   _initScene() {
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(
-      CAMERA.fov, window.innerWidth / window.innerHeight, 0.4, 3000
+      CAMERA.fov, window.innerWidth / window.innerHeight, 0.4, 4000
     );
     this.camera.position.set(0, 20, -40);
     this.camYaw = 0;
@@ -85,91 +95,155 @@ class Game {
     this.lookTarget = new THREE.Vector3();
   }
 
-  /** Heavy construction, yielded between steps so the loading text can paint. */
-  async build() {
-    const note = document.getElementById('loading-note');
+  async boot() {
+    this.input = new Input(window);
+    this.input.bindTouch(document);
+    this.audio = new Audio();
+    this.menu = new Menu(this);
+    this._wireInput();
+
+    await this.loadTrack(DEFAULT_TRACK);
+
+    this.state = 'menu';
+    this.menu.onReady();
+  }
+
+  // ----------------------------------------------------------- track loading
+
+  /**
+   * Build (or rebuild) everything that belongs to a circuit. Yields between the
+   * heavy steps so the loading text can actually paint.
+   *
+   * @param roster  optional array of {name, color, accent, remote, netId} in grid
+   *                order -- multiplayer supplies real players plus CPU filler.
+   */
+  async loadTrack(trackId, { roster = null, localSlot = 0, note = null } = {}) {
+    const def = trackById(trackId);
+    const STEPS = 5;
+    let done = 0;
+    const say = (text) => {
+      if (note) note(text);
+      this.menu?.onLoadStep(text, done / STEPS);
+    };
     const step = async (label, fn) => {
-      note.textContent = label;
+      say(label);
       await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      return fn();
+      const result = fn();
+      done++;
+      return result;
     };
 
-    this.track = await step('laying out the circuit…', () => new Track());
+    // Nothing may tick while the world is being swapped out from under it.
+    this.state = 'loading';
+    this.unloadTrack();
+    applyHandling(def.handling);
+
+    this.trackId = def.id;
+    this.track = await step('laying out the circuit…', () => {
+      const track = new Track(def);
+      track.theme = { ...def.theme, key: def.id };
+      return track;
+    });
+    RACE.laps = this.track.laps;
+
     await step('paving…', () => {
       const built = buildTrackMesh(this.track);
+      this.trackGroup = built.group;
       this.scene.add(built.group);
       this.boostPadMeshes = built.boostPads;
     });
-    await step('raising the ridge…', () => {
+    await step('raising the landscape…', () => {
       this.world = new World(this.scene, this.track);
     });
     await step('rolling out the grid…', () => {
       this.particles = new Particles(this.scene);
-      this.karts = [];
-      this.drivers = [];
-      this.inputsByKart = [];
-      for (let i = 0; i < RACE.racerCount; i++) {
-        const kart = new Kart(this, i, RACERS[i % RACERS.length]);
-        this.karts.push(kart);
-        this.inputsByKart.push(EMPTY_INPUT);
-        this.drivers.push(i === 0 ? null : new AIDriver(kart, AI_PROFILES[i] || AI_PROFILES[1], i));
-      }
-      this.player = this.karts[0];
-      Object.assign(this, makeRubberBand(this));
+      this.buildField(roster, localSlot);
       this.items = new ItemSystem(this);
     });
     await step('ready', () => {
-      this.hud = new HUD(this);
-      this.input = new Input(window);
-      this.input.bindTouch(document);
-      this.audio = new Audio();
-      this._wireUI();
+      if (this.hud) this.hud.bindTrack();
+      else this.hud = new HUD(this);
       this.resetRace();
     });
-
-    note.textContent = 'ready when you are';
-    document.getElementById('start-btn').disabled = false;
-    this.state = 'menu';
+    say('ready when you are');
   }
 
-  _wireUI() {
-    const start = document.getElementById('start-btn');
-    const again = document.getElementById('again-btn');
-    const resume = document.getElementById('resume-btn');
-    const restart = document.getElementById('restart-btn');
+  unloadTrack() {
+    if (this.karts) for (const kart of this.karts) kart.dispose();
+    this.karts = null;
+    this.items?.dispose();
+    this.items = null;
+    this.world?.dispose();
+    this.world = null;
+    if (this.trackGroup) {
+      this.scene.remove(this.trackGroup);
+      this.trackGroup.traverse((node) => {
+        node.geometry?.dispose?.();
+        const mat = node.material;
+        if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+        else mat?.dispose?.();
+      });
+      this.trackGroup = null;
+    }
+    if (this.particles) {
+      this.scene.remove(this.particles.points);
+      this.particles.geo.dispose();
+      this.particles.points.material.dispose();
+      this.particles = null;
+    }
+    this.track?.dispose();
+    this.track = null;
+    this.boostPadMeshes = null;
+  }
 
-    start.addEventListener('click', () => this.beginRace());
-    again.addEventListener('click', () => {
-      this.hud.hideResults();
-      this.beginRace();
-    });
-    resume.addEventListener('click', () => this.setPaused(false));
-    restart.addEventListener('click', () => {
-      this.setPaused(false);
-      this.hud.hideResults();
-      this.beginRace();
-    });
+  /** Create the karts, their drivers and the grid order. */
+  buildField(roster, localSlot) {
+    const entries = roster || RACERS.map((r) => ({ ...r, remote: false }));
+    this.karts = [];
+    this.drivers = [];
+    this.inputsByKart = [];
+    this.localSlot = roster ? localSlot : 0;
 
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      const kart = new Kart(this, i, entry);
+      kart.remote = !!entry.remote;
+      kart.netId = entry.netId || null;
+      kart.netSlot = i;
+      kart.isPlayer = i === this.localSlot;
+      kart.tag.visible = !kart.isPlayer;
+      // Solo: the player starts at the back of the grid. Multiplayer: everyone
+      // lines up in the order the server dealt out.
+      kart.gridIndex = roster ? i : (i === 0 ? entries.length - 1 : i - 1);
+      this.karts.push(kart);
+      this.inputsByKart.push(EMPTY_INPUT);
+
+      const wantsAI = !kart.remote && !kart.isPlayer;
+      this.drivers.push(
+        wantsAI ? new AIDriver(kart, AI_PROFILES[i] || AI_PROFILES[1], i) : null
+      );
+    }
+    this.player = this.karts[this.localSlot];
+    Object.assign(this, makeRubberBand(this));
+  }
+
+  _wireInput() {
     this.input.onAction = (action) => {
       if (action === 'pause') {
         if (this.state === 'racing' || this.state === 'countdown') this.setPaused(true);
-        else if (this.state === 'paused') this.setPaused(false);
+        else if (this.overlayPaused || this.state === 'paused') this.setPaused(false);
       } else if (action === 'mute') {
         this.audio.setMuted(!this.audio.muted);
-        this.hud.message(this.audio.muted ? 'MUTED' : 'SOUND ON', 'cool');
+        this.hud?.message(this.audio.muted ? 'MUTED' : 'SOUND ON', 'cool');
       } else if (action === 'respawn') {
         if (this.state === 'racing' && !this.player.isStunned) this.player.startRespawn();
       } else if (action === 'confirm') {
-        if (this.state === 'menu') this.beginRace();
-        else if (this.state === 'results') {
-          this.hud.hideResults();
-          this.beginRace();
-        }
+        this.menu?.onConfirm();
       }
     };
 
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden && this.state === 'racing') this.setPaused(true);
+      if (document.hidden && this.state === 'racing' && this.mode === 'solo') this.setPaused(true);
     });
 
     // Touch controls only appear on devices that actually have a touchscreen.
@@ -186,16 +260,13 @@ class Game {
     this.finishDelay = 0;
     this.resultsShown = false;
     this.throttleHeld = 0;
+    this.netAccum = 0;
     this.items?.reset();
 
     for (let i = 0; i < this.karts.length; i++) {
       const kart = this.karts[i];
-      // The player lines up at the back of the grid.
-      const slot = kart.isPlayer ? this.karts.length - 1 : i - 1;
-      const row = Math.floor(slot / 2);
-      const s = this.track.wrap(-(9 + row * 8.5));
-      const lateral = slot % 2 === 0 ? -4.6 : 4.6;
-      kart.placeAt(s, lateral);
+      const slot = this.track.gridSlot(kart.gridIndex);
+      kart.placeAt(slot.s, slot.lateral);
       kart.item = null;
       kart.itemRoulette = 0;
       kart.lap = 1;
@@ -207,6 +278,9 @@ class Game {
       kart.empTimer = 0;
       kart.respawnTimer = 0;
       kart.boostTimer = 0;
+      kart.left = false;
+      kart.net.valid = false;
+      kart.model.visible = true;
       kart.place = i + 1;
     }
 
@@ -215,7 +289,6 @@ class Game {
   }
 
   beginRace() {
-    document.getElementById('start-screen').hidden = true;
     this.audio.start();
     this.resetRace();
     this.hud.show();
@@ -225,6 +298,18 @@ class Game {
 
   setPaused(paused) {
     const el = document.getElementById('pause-screen');
+    // In a multiplayer race the world keeps turning: the overlay is a menu, not
+    // a freeze frame, or everybody else would drive off without you.
+    if (this.mode === 'net') {
+      if (paused && (this.state === 'racing' || this.state === 'countdown')) {
+        this.overlayPaused = true;
+        el.hidden = false;
+      } else if (!paused) {
+        this.overlayPaused = false;
+        el.hidden = true;
+      }
+      return;
+    }
     if (paused && (this.state === 'racing' || this.state === 'countdown')) {
       this.pausedFrom = this.state;
       this.state = 'paused';
@@ -236,17 +321,27 @@ class Game {
   }
 
   finalize() {
-    // Give every unfinished kart a plausible time rather than a bare DNF.
-    for (const kart of this.karts) {
-      if (kart.finished) continue;
-      const remaining = this.track.length * RACE.laps - kart.distance;
-      const pace = Math.max(18, kart.distance / Math.max(1, this.raceTime));
-      kart.finished = true;
-      kart.finishTime = this.raceTime + remaining / pace;
+    // Solo: give every unfinished kart a plausible time rather than a bare DNF
+    // and call it a day. Networked: the race is genuinely still on for everyone
+    // who has not crossed the line, so nothing gets a made-up time and the board
+    // keeps updating as they come in.
+    if (this.mode === 'solo') {
+      for (const kart of this.karts) {
+        if (kart.finished || kart.left) continue;
+        const remaining = this.track.raceDistance - kart.distance;
+        const pace = Math.max(18, kart.distance / Math.max(1, this.raceTime));
+        kart.finished = true;
+        kart.finishTime = this.raceTime + remaining / pace;
+      }
     }
     this.updateStandings();
     this.resultsShown = true;
-    this.hud.showResults(this.standings);
+    this.resultsSignature = this.standingsSignature();
+    this.hud.showResults(this.standings, this.mode === 'net');
+  }
+
+  standingsSignature() {
+    return this.standings.map((k) => `${k.index}:${k.finished ? 1 : 0}`).join(',');
   }
 
   // -------------------------------------------------------------- the loop
@@ -265,7 +360,7 @@ class Game {
   }
 
   tick(frameDt) {
-    if (this.state === 'loading') return;
+    if (this.state === 'loading' || !this.track || !this.karts) return;
     this.elapsed += frameDt;
 
     const playing = this.state === 'countdown' || this.state === 'racing' || this.state === 'results';
@@ -278,12 +373,13 @@ class Game {
         this.step(dt);
         remaining -= dt;
       }
+      this.pumpNetwork(frameDt);
     } else if (this.state === 'menu') {
       this.orbitMenuCamera(frameDt);
     }
 
     this.particles?.update(frameDt);
-    this.world?.update(frameDt, this.elapsed);
+    this.world?.update(frameDt, this.elapsed, this.camera);
     if (this.boostPadMeshes) this.animateBoostPads();
 
     if (this.hud && this.state !== 'menu' && this.state !== 'loading') {
@@ -305,10 +401,14 @@ class Game {
 
     for (let i = 0; i < this.karts.length; i++) {
       const kart = this.karts[i];
-      let input;
+      let input = EMPTY_INPUT;
+      if (kart.remote) {
+        kart.update(dt, input);
+        continue;
+      }
       if (kart.isPlayer) {
         input = frozen ? this.countdownInput(playerInput) : playerInput;
-      } else {
+      } else if (this.drivers[i]) {
         input = frozen ? EMPTY_INPUT : this.drivers[i].update(dt, this);
       }
       this.inputsByKart[i] = input;
@@ -332,6 +432,13 @@ class Game {
     if (this.state === 'results' && !this.resultsShown) {
       this.finishDelay -= dt;
       if (this.finishDelay <= 0) this.finalize();
+    } else if (this.state === 'results' && this.mode === 'net') {
+      // Redraw the board as the rest of the grid takes the flag.
+      const signature = this.standingsSignature();
+      if (signature !== this.resultsSignature) {
+        this.resultsSignature = signature;
+        this.hud.showResults(this.standings, true);
+      }
     }
   }
 
@@ -362,8 +469,9 @@ class Game {
         this.audio.boost();
       }
       // CPUs get a small, varied jump off the line too.
-      for (let i = 1; i < this.karts.length; i++) {
-        if (Math.random() < 0.45) this.karts[i].applyBoost(0.6 + Math.random() * 0.7, 1);
+      for (const kart of this.karts) {
+        if (kart.isPlayer || kart.remote) continue;
+        if (Math.random() < 0.45) kart.applyBoost(0.6 + Math.random() * 0.7, 1);
       }
     }
   }
@@ -376,10 +484,145 @@ class Game {
     };
   }
 
+  // ------------------------------------------------------------- multiplayer
+
+  /** Hand the game a connected client; the menu owns the lobby side of it. */
+  attachNet(net) {
+    this.net = net;
+    net.on('state', (msg) => this.onNetState(msg));
+    net.on('event', (msg) => this.onNetEvent(msg));
+    net.on('left', (msg) => this.onNetLeft(msg));
+    net.on('room', (msg) => this.onNetRoom(msg));
+    net.on('close', () => {
+      if (this.mode === 'net' && this.state !== 'menu') {
+        this.hud?.message('DISCONNECTED', 'bad');
+      }
+    });
+  }
+
+  pumpNetwork(dt) {
+    if (this.mode !== 'net' || !this.net?.connected) return;
+    this.netAccum += dt;
+    if (this.netAccum < 1 / NET.sendHz) return;
+    this.netAccum = 0;
+    const states = [];
+    for (const kart of this.karts) {
+      if (!kart.remote && !kart.left) states.push(kart.toNetState());
+    }
+    this.net.sendStates(states);
+  }
+
+  onNetState(msg) {
+    if (!this.karts || !Array.isArray(msg.k)) return;
+    for (const a of msg.k) {
+      const kart = this.karts[a[0]];
+      if (!kart || !kart.remote) continue;
+      kart.applyNetState(a);
+    }
+  }
+
+  onNetEvent(msg) {
+    if (!this.items || !this.karts) return;
+    const kart = this.karts[msg.slot];
+    switch (msg.ev) {
+      case 'item':
+        if (kart && kart.remote) this.items.useRemote(kart, msg.item);
+        break;
+      case 'box':
+        this.items.takeBox(msg.i);
+        break;
+      default:
+        break;
+    }
+  }
+
+  onNetLeft(msg) {
+    const kart = this.karts?.[msg.slot];
+    if (!kart || !kart.remote) return;
+    kart.left = true;
+    kart.model.visible = false;
+    kart.finished = true;
+    if (!kart.finishTime) kart.finishTime = 0;
+  }
+
+  /**
+   * The host simulates the CPUs. If the host walks out mid-race the server
+   * promotes somebody else -- who has to pick the abandoned karts up, or six of
+   * them would simply stop dead on the racing line.
+   */
+  onNetRoom(msg) {
+    if (this.mode !== 'net' || !this.karts) return;
+    if (msg.host !== this.net?.id) return;
+    if (!['countdown', 'racing', 'results'].includes(this.state)) return;
+
+    let adopted = 0;
+    for (let i = 0; i < this.karts.length; i++) {
+      const kart = this.karts[i];
+      if (!kart.remote || kart.netId || kart.left) continue;
+      kart.remote = false;
+      kart.net.valid = false;
+      kart.project();
+      kart.syncProgressFromDistance();
+      this.drivers[i] = new AIDriver(kart, AI_PROFILES[i] || AI_PROFILES[1], i);
+      adopted++;
+    }
+    if (adopted) this.hud?.message('CPU HANDOVER', 'cool');
+  }
+
+  /** Load a circuit for a networked race and tell the server when we are set. */
+  async startNetRace(trackId, players, localId) {
+    this.mode = 'net';
+    const roster = [];
+    for (const p of players) {
+      const livery = RACERS[p.slot % RACERS.length];
+      roster.push({
+        name: p.name,
+        color: livery.color,
+        accent: livery.accent,
+        remote: p.id !== localId,
+        netId: p.id,
+      });
+    }
+    const isHost = this.net?.isHost;
+    for (let i = roster.length; i < RACE.racerCount; i++) {
+      const livery = RACERS[i % RACERS.length];
+      // CPUs are simulated by the host and mirrored by everybody else.
+      roster.push({ name: `CPU ${livery.name}`, color: livery.color, accent: livery.accent, remote: !isHost });
+    }
+    const localSlot = players.findIndex((p) => p.id === localId);
+    await this.loadTrack(trackId, { roster, localSlot: Math.max(0, localSlot) });
+    this.net.reportLoaded();
+  }
+
+  /** The server's shared start stamp; everyone drops the clutch together. */
+  scheduleNetStart(atServerMs) {
+    const delay = Math.max(0, atServerMs - this.net.serverNow());
+    setTimeout(() => {
+      if (this.mode !== 'net') return;
+      this.beginRace();
+    }, delay);
+  }
+
+  async startSolo(trackId) {
+    const wasNetworked = this.mode === 'net';
+    this.mode = 'solo';
+    if (wasNetworked || trackId !== this.trackId) await this.loadTrack(trackId);
+    this.beginRace();
+  }
+
+  /** Drop out of a race (or a results board) and back to the attract camera. */
+  returnToMenu() {
+    this.state = 'menu';
+    this.overlayPaused = false;
+    this.hud?.hide();
+    this.hud?.hideResults();
+    document.getElementById('pause-screen').hidden = true;
+  }
+
   // ------------------------------------------------------------- standings
 
   updateStandings() {
-    const order = this.karts.slice().sort((a, b) => {
+    const order = this.karts.filter((k) => !k.left).sort((a, b) => {
       if (a.finished && b.finished) return a.finishTime - b.finishTime;
       if (a.finished) return -1;
       if (b.finished) return 1;
@@ -394,7 +637,7 @@ class Game {
     let best = null;
     let bestGap = Infinity;
     for (const other of this.karts) {
-      if (other === kart) continue;
+      if (other === kart || other.left) continue;
       const gap = other.distance - kart.distance;
       if (gap <= 2 || gap > range) continue;
       if (gap < bestGap) {
@@ -409,7 +652,7 @@ class Game {
     let best = null;
     let bestGap = Infinity;
     for (const other of this.karts) {
-      if (other === kart) continue;
+      if (other === kart || other.left) continue;
       const gap = kart.distance - other.distance;
       if (gap <= 2 || gap > range) continue;
       if (gap < bestGap) {
@@ -434,6 +677,10 @@ class Game {
         const a = karts[i];
         const b = karts[j];
         if (a.respawnTimer > 0 || b.respawnTimer > 0) continue;
+        if (a.left || b.left) continue;
+        // Two remote karts are somebody else's problem; pushing them apart here
+        // would only fight the state stream.
+        if (a.remote && b.remote) continue;
 
         _v.copy(b.position).sub(a.position);
         const distSq = _v.lengthSq();
@@ -443,15 +690,19 @@ class Game {
         _v.multiplyScalar(1 / dist);
         const overlap = minDist - dist;
 
-        a.position.addScaledVector(_v, -overlap * 0.5);
-        b.position.addScaledVector(_v, overlap * 0.5);
+        // Only shove the karts this client actually owns.
+        const aFree = !a.remote;
+        const bFree = !b.remote;
+        const share = aFree && bFree ? 0.5 : 1;
+        if (aFree) a.position.addScaledVector(_v, -overlap * share);
+        if (bFree) b.position.addScaledVector(_v, overlap * share);
 
         // Exchange a slice of the closing velocity so bumps feel weighty.
         const closing = _v2.copy(b.velocity).sub(a.velocity).dot(_v);
         if (closing < 0) {
           const impulse = -closing * 0.55;
-          a.velocity.addScaledVector(_v, -impulse);
-          b.velocity.addScaledVector(_v, impulse);
+          if (aFree) a.velocity.addScaledVector(_v, -impulse);
+          if (bFree) b.velocity.addScaledVector(_v, impulse);
           if (Math.abs(closing) > 9) {
             const point = _v2.copy(a.position).add(b.position).multiplyScalar(0.5);
             this.particles.burst(point, 8, this.colors.driftDust, {
@@ -550,7 +801,7 @@ class Game {
   orbitMenuCamera(dt) {
     // Slow fly-around of the start straight while the menu is up.
     const t = this.elapsed * 0.13;
-    const frame = this.track.frameAt(this.track.length * 0.05);
+    const frame = this.track.frameAt(this.track.startLineS + this.track.length * 0.02);
     const radius = 46;
     this.camera.position.set(
       frame.position.x + Math.cos(t) * radius,
@@ -588,9 +839,14 @@ class Game {
 
   onLap(kart, lap) {
     if (!kart.isPlayer) return;
-    if (lap === RACE.laps) this.hud.message('FINAL LAP!', 'bad');
+    if (lap === this.track.laps) this.hud.message('FINAL LAP!', 'bad');
     else this.hud.message(`LAP ${lap}`, 'cool');
     this.audio.lap();
+  }
+
+  onMissedCheckpoint(kart) {
+    if (!kart.isPlayer) return;
+    this.hud.message('MISSED A CHECKPOINT', 'bad');
   }
 
   onFinish(kart) {
@@ -694,8 +950,15 @@ class Game {
     if (kart.isPlayer) this.audio.pickup();
   }
 
+  onBoxTaken(kart, index) {
+    if (this.mode === 'net') this.net?.sendEvent('box', { i: index, slot: kart.netSlot });
+  }
+
   onItemUsed(kart, item) {
     if (kart.isPlayer && item === 'boost') this.audio.boost();
+    if (this.mode === 'net' && !kart.remote && REPLICATED_ITEMS.has(item)) {
+      this.net?.sendEvent('item', { slot: kart.netSlot, item });
+    }
   }
 
   onFall(kart) {
@@ -708,10 +971,10 @@ class Game {
 // ---------------------------------------------------------------- bootstrap
 
 const game = new Game();
+game.tracks = TRACKS;
 window.game = game;   // handy for poking at things from the console
 
-document.getElementById('start-btn').disabled = true;
-game.build().then(() => game.start()).catch((err) => {
+game.boot().then(() => game.start()).catch((err) => {
   console.error(err);
   const note = document.getElementById('loading-note');
   if (note) note.textContent = `failed to start: ${err.message}`;

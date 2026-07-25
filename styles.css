@@ -605,3 +605,205 @@ h2 {
   .countdown { font-size: 110px; }
   .panel { padding: 24px 20px; }
 }
+
+/* ============================ Track select & lobby ============================ */
+
+.panel.wide { width: min(880px, 100%); }
+
+.track-name {
+  margin-top: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  color: var(--ink);
+  opacity: 0.85;
+  text-transform: uppercase;
+  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.9), 0 0 3px rgba(0, 0, 0, 0.8);
+}
+
+.button-row {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.track-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  margin: 0 0 20px;
+}
+
+.track-card {
+  --tc-tint: var(--hot-2);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 14px;
+  text-align: left;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--dim);
+  font-family: var(--font);
+  cursor: pointer;
+  transition: transform 0.14s ease, border-color 0.14s ease, background 0.14s ease;
+}
+
+.track-card:hover { transform: translateY(-2px); border-color: rgba(255, 255, 255, 0.3); }
+
+.track-card.on {
+  border-color: var(--tc-tint);
+  background: linear-gradient(150deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.03));
+  color: var(--ink);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+}
+
+.track-card.locked { cursor: not-allowed; opacity: 0.72; }
+.track-card.locked:hover { transform: none; }
+
+.tc-name { font-size: 17px; font-weight: 800; letter-spacing: 1px; color: var(--ink); }
+.tc-meta { font-size: 11px; letter-spacing: 2.5px; color: var(--tc-tint); font-weight: 700; }
+.tc-blurb { font-size: 12.5px; line-height: 1.35; color: var(--dim); }
+
+.track-grid.compact .tc-blurb { display: none; }
+.track-grid.compact { grid-template-columns: repeat(2, 1fr); }
+
+/* --- Multiplayer entry --- */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 auto 18px;
+  max-width: 280px;
+  text-align: left;
+}
+
+.field span { font-size: 11px; letter-spacing: 3px; color: var(--dim); font-weight: 700; }
+
+.field input, .join-row input {
+  width: 100%;
+  padding: 11px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(4, 6, 14, 0.7);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  outline: none;
+}
+
+.field input:focus, .join-row input:focus { border-color: var(--cool); }
+
+.join-row {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  align-items: stretch;
+  margin: 16px auto 6px;
+  max-width: 320px;
+}
+
+.join-row input { text-align: center; max-width: 150px; }
+
+.mp-status {
+  min-height: 22px;
+  margin: 12px 0 6px;
+  font-size: 14px;
+  color: var(--hot-2);
+  letter-spacing: 0.5px;
+}
+
+.cta.small { padding: 9px 20px; font-size: 13px; }
+
+/* --- Lobby --- */
+
+.room-code {
+  font-size: clamp(44px, 9vw, 76px);
+  font-weight: 800;
+  letter-spacing: 14px;
+  margin: 0 0 20px;
+  color: var(--hot-2);
+  text-shadow: 0 0 30px rgba(255, 210, 63, 0.35);
+}
+
+.lobby-cols {
+  display: grid;
+  grid-template-columns: 1fr 1.25fr;
+  gap: 22px;
+  margin-bottom: 20px;
+  text-align: left;
+}
+
+.lobby-col h3 {
+  margin: 0 0 10px;
+  font-size: 12px;
+  letter-spacing: 4px;
+  color: var(--dim);
+  font-weight: 700;
+}
+
+.lobby-col h3 .dim { color: var(--dim); opacity: 0.7; letter-spacing: 1px; }
+
+.lobby-players { display: flex; flex-direction: column; gap: 7px; }
+
+.lobby-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid transparent;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+
+.lobby-row.me { border-color: rgba(53, 209, 255, 0.55); background: rgba(53, 209, 255, 0.1); }
+.lobby-row .dot { width: 11px; height: 11px; border-radius: 50%; flex: none; }
+.lobby-row .lp-name { flex: 1; }
+
+.tag {
+  font-size: 10px;
+  letter-spacing: 2px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.09);
+  color: var(--dim);
+}
+
+.tag.host { color: #05070e; background: var(--hot-2); }
+.tag.ready { color: #05070e; background: #7cf07c; }
+
+.cta:disabled { opacity: 0.4; cursor: not-allowed; transform: none; box-shadow: none; }
+
+/* --- Loading --- */
+
+.loading-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+  margin: 18px 0 12px;
+}
+
+#loading-fill {
+  height: 100%;
+  width: 4%;
+  border-radius: 4px;
+  background: linear-gradient(90deg, var(--hot), var(--hot-2));
+  transition: width 0.35s ease;
+}
+
+@media (max-width: 780px) {
+  .lobby-cols { grid-template-columns: 1fr; }
+  .track-grid { grid-template-columns: repeat(2, 1fr); }
+  .tc-blurb { display: none; }
+  .room-code { letter-spacing: 8px; }
+}

@@ -1,23 +1,26 @@
 import * as THREE from 'three';
+import * as TX from './textures.js';
 
 /**
  * The environment around the circuit.
  *
- * The terrain is a single heightfield that is *derived* from the track: near the
- * road it hugs the road's own elevation (taking the LOWEST nearby road height, so
- * a section that flies over another becomes a viaduct rather than a landslide),
- * and far away it relaxes into rolling hills. Gap sections carve downward instead,
- * which is what gouges the canyon under the big glider jump.
+ * The terrain is a single heightfield that is *derived* from the track:
+ *
+ *   - a coarse "regional" field carries the large-scale elevation of the course,
+ *     so a circuit that climbs 400 m gets a mountain under it rather than a road
+ *     on stilts;
+ *   - near the road the sheet hugs the road's own elevation, taking the LOWEST
+ *     nearby road height so a section that flies over another becomes a viaduct
+ *     rather than a landslide;
+ *   - gap sections carve downward instead, which is what gouges the canyons under
+ *     the glider jumps.
+ *
+ * Palette, scenery, sky and weather all come from the loaded track's theme.
  */
 
-const TERRAIN_SIZE = 1500;
-const TERRAIN_SEGMENTS = 190;
-const CANYON_FLOOR = -34;
-const WATER_LEVEL = -20;
-const ROAD_CLEARANCE = 3.0;   // how far the ground sits below the road deck
 const ROAD_INFLUENCE = 110;   // radius over which the road shapes the terrain
-
-const SUN_DIRECTION = new THREE.Vector3(-0.42, 0.36, -0.84).normalize();
+const REGIONAL_RADIUS = 460;  // radius over which the course shapes the landscape
+const AMBIENT_BOX = 150;      // half-size of the weather box that follows the camera
 
 function hash2(x, y) {
   const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
@@ -62,9 +65,11 @@ class SampleGrid {
   constructor(track, cell = 55) {
     this.cell = cell;
     this.buckets = new Map();
+    this.gapBuckets = new Map();
     this.solid = [];
     this.gap = [];
-    for (let i = 0; i < track.sampleCount; i += 2) {
+    const stride = Math.max(2, Math.round(2.5 / track.sampleSpacing));
+    for (let i = 0; i < track.sampleCount; i += stride) {
       const p = track.positions[i];
       if (track.isGapSample[i]) {
         // Record how far this sample sits from the nearest end of its gap, so the
@@ -77,19 +82,20 @@ class SampleGrid {
         this.solid.push({ x: p.x, z: p.z, y: p.y });
       }
     }
-    for (const e of this.solid) this._insert(e);
+    for (const e of this.solid) this._insert(this.buckets, e);
+    for (const e of this.gap) this._insert(this.gapBuckets, e);
   }
 
   _key(cx, cz) {
     return cx * 73856093 ^ cz * 19349663;
   }
 
-  _insert(e) {
+  _insert(map, e) {
     const cx = Math.floor(e.x / this.cell);
     const cz = Math.floor(e.z / this.cell);
     const k = this._key(cx, cz);
-    let list = this.buckets.get(k);
-    if (!list) this.buckets.set(k, (list = []));
+    let list = map.get(k);
+    if (!list) map.set(k, (list = []));
     list.push(e);
   }
 
@@ -120,19 +126,31 @@ class SampleGrid {
   }
 
   /** Distance to the nearest gap centreline sample, plus that sample's end taper. */
-  queryGap(x, z) {
+  queryGap(x, z, radius) {
+    const cell = this.cell;
+    const r = Math.ceil(radius / cell);
+    const cx = Math.floor(x / cell);
+    const cz = Math.floor(z / cell);
     let best = Infinity;
     let fromEnd = 0;
-    for (const e of this.gap) {
-      const dx = e.x - x;
-      const dz = e.z - z;
-      const d2 = dx * dx + dz * dz;
-      if (d2 < best) {
-        best = d2;
-        fromEnd = e.fromEnd;
+    let height = 0;
+    for (let a = -r; a <= r; a++) {
+      for (let b = -r; b <= r; b++) {
+        const list = this.gapBuckets.get(this._key(cx + a, cz + b));
+        if (!list) continue;
+        for (const e of list) {
+          const dx = e.x - x;
+          const dz = e.z - z;
+          const d2 = dx * dx + dz * dz;
+          if (d2 < best) {
+            best = d2;
+            fromEnd = e.fromEnd;
+            height = e.y;
+          }
+        }
       }
     }
-    return { dist: Math.sqrt(best), fromEnd };
+    return { dist: Math.sqrt(best), fromEnd, height };
   }
 }
 
@@ -140,29 +158,165 @@ export class World {
   constructor(scene, track) {
     this.scene = scene;
     this.track = track;
+    this.theme = track.theme;
     this.grid = new SampleGrid(track);
+    this.objects = [];
 
+    this._measure();
+    this._buildElevationField();
     this._buildSky();
     this._buildLights();
     this._buildTerrain();
     this._buildWater();
+    this._buildChasms();
     this._buildScenery();
     this._buildPylons();
+    this._buildAmbient();
+  }
+
+  /** Everything is sized off the circuit's footprint, not a fixed sheet. */
+  _measure() {
+    const box = new THREE.Box3();
+    for (const p of this.track.positions) box.expandByPoint(p);
+    const size = box.getSize(new THREE.Vector3());
+    this.centre = box.getCenter(new THREE.Vector3());
+    this.terrainSize = Math.max(size.x, size.z) + 640;
+    this.terrainSegments = THREE.MathUtils.clamp(Math.round(this.terrainSize / 11), 150, 260);
+    this.terrainStep = this.terrainSize / this.terrainSegments;
+    this.terrainCols = this.terrainSegments + 1;
+  }
+
+  _add(object) {
+    this.scene.add(object);
+    this.objects.push(object);
+    return object;
+  }
+
+  // ------------------------------------------------- regional elevation field
+
+  /**
+   * A blurred map of how high the *course* is in each part of the world. Road
+   * samples are splatted into a coarse grid with a falloff, then holes are
+   * filled by dilation. Without this the hills would sit at sea level under a
+   * circuit that spends its life 400 m up.
+   */
+  _buildElevationField() {
+    const cell = 52;
+    const cols = Math.ceil(this.terrainSize / cell) + 3;
+    const origin = new THREE.Vector2(
+      this.centre.x - this.terrainSize / 2 - cell,
+      this.centre.z - this.terrainSize / 2 - cell
+    );
+    const sum = new Float32Array(cols * cols);
+    const weight = new Float32Array(cols * cols);
+
+    const R = REGIONAL_RADIUS;
+    const span = Math.ceil(R / cell);
+    const samples = this.grid.solid.concat(this.grid.gap);
+    for (const e of samples) {
+      const cx = Math.floor((e.x - origin.x) / cell);
+      const cz = Math.floor((e.z - origin.y) / cell);
+      for (let a = -span; a <= span; a++) {
+        for (let b = -span; b <= span; b++) {
+          const ix = cx + a;
+          const iz = cz + b;
+          if (ix < 0 || iz < 0 || ix >= cols || iz >= cols) continue;
+          const px = origin.x + (ix + 0.5) * cell;
+          const pz = origin.y + (iz + 0.5) * cell;
+          const d = Math.hypot(px - e.x, pz - e.z);
+          if (d > R) continue;
+          const w = (1 - d / R) ** 2;
+          const k = iz * cols + ix;
+          sum[k] += e.y * w;
+          weight[k] += w;
+        }
+      }
+    }
+
+    const field = new Float32Array(cols * cols);
+    const known = new Uint8Array(cols * cols);
+    let mean = 0;
+    let meanCount = 0;
+    for (let i = 0; i < field.length; i++) {
+      if (weight[i] > 1e-5) {
+        field[i] = sum[i] / weight[i];
+        known[i] = 1;
+        mean += field[i];
+        meanCount++;
+      }
+    }
+    mean = meanCount ? mean / meanCount : 0;
+
+    // Dilate outward until the whole sheet has a value.
+    for (let pass = 0; pass < 60; pass++) {
+      let filled = 0;
+      const next = known.slice();
+      for (let z = 0; z < cols; z++) {
+        for (let x = 0; x < cols; x++) {
+          const k = z * cols + x;
+          if (known[k]) continue;
+          let acc = 0;
+          let n = 0;
+          for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+            const nx = x + dx;
+            const nz = z + dz;
+            if (nx < 0 || nz < 0 || nx >= cols || nz >= cols) continue;
+            const nk = nz * cols + nx;
+            if (!known[nk]) continue;
+            acc += field[nk];
+            n++;
+          }
+          if (n) {
+            field[k] = acc / n;
+            next[k] = 1;
+            filled++;
+          }
+        }
+      }
+      known.set(next);
+      if (!filled) break;
+    }
+    for (let i = 0; i < field.length; i++) if (!known[i]) field[i] = mean;
+
+    this.field = { data: field, cols, cell, origin };
+  }
+
+  _regionalHeight(x, z) {
+    const f = this.field;
+    const fx = THREE.MathUtils.clamp((x - f.origin.x) / f.cell - 0.5, 0, f.cols - 1.001);
+    const fz = THREE.MathUtils.clamp((z - f.origin.y) / f.cell - 0.5, 0, f.cols - 1.001);
+    const x0 = Math.floor(fx);
+    const z0 = Math.floor(fz);
+    const tx = fx - x0;
+    const tz = fz - z0;
+    const d = f.data;
+    const c = f.cols;
+    const h00 = d[z0 * c + x0];
+    const h10 = d[z0 * c + x0 + 1];
+    const h01 = d[(z0 + 1) * c + x0];
+    const h11 = d[(z0 + 1) * c + x0 + 1];
+    return (h00 * (1 - tx) + h10 * tx) * (1 - tz) + (h01 * (1 - tx) + h11 * tx) * tz;
   }
 
   // ------------------------------------------------------------------- sky
 
   _buildSky() {
-    const geo = new THREE.SphereGeometry(2600, 32, 20);
+    const t = this.theme.sky;
+    const geo = new THREE.SphereGeometry(3200, 32, 20);
     const mat = new THREE.ShaderMaterial({
       side: THREE.BackSide,
       depthWrite: false,
       uniforms: {
-        uSun: { value: SUN_DIRECTION.clone() },
-        uZenith: { value: new THREE.Color(0x1a2352) },
-        uMid: { value: new THREE.Color(0xc9578a) },
-        uHorizon: { value: new THREE.Color(0xffb277) },
-        uGround: { value: new THREE.Color(0x2a2233) },
+        uSun: { value: new THREE.Vector3(...this.theme.sun.dir).normalize() },
+        uZenith: { value: new THREE.Color(t.zenith) },
+        uMid: { value: new THREE.Color(t.mid) },
+        uHorizon: { value: new THREE.Color(t.horizon) },
+        uGround: { value: new THREE.Color(t.ground) },
+        uGlowColor: { value: new THREE.Vector3(...t.glowColor) },
+        uGlow: { value: t.glow },
+        uDisc: { value: new THREE.Vector3(...t.discColor) },
+        uBand: { value: new THREE.Vector3(...t.band) },
+        uBandFreq: { value: t.bandFreq },
       },
       vertexShader: /* glsl */ `
         varying vec3 vDir;
@@ -172,7 +326,8 @@ export class World {
         }
       `,
       fragmentShader: /* glsl */ `
-        uniform vec3 uSun, uZenith, uMid, uHorizon, uGround;
+        uniform vec3 uSun, uZenith, uMid, uHorizon, uGround, uGlowColor, uDisc, uBand;
+        uniform float uGlow, uBandFreq;
         varying vec3 vDir;
         void main() {
           vec3 d = normalize(vDir);
@@ -181,11 +336,11 @@ export class World {
           col = mix(col, uZenith, smoothstep(0.16, 0.62, h));
           col = mix(uGround, col, smoothstep(-0.22, 0.005, h));
           float sd = max(dot(d, normalize(uSun)), 0.0);
-          col += vec3(1.0, 0.72, 0.42) * pow(sd, 6.0) * 0.42;
-          col += vec3(1.0, 0.93, 0.78) * pow(sd, 900.0) * 6.0;
-          // Faint banding to suggest high cloud.
-          float band = sin(d.y * 44.0 + d.x * 3.0) * 0.5 + 0.5;
-          col += vec3(0.06, 0.03, 0.05) * band * smoothstep(0.02, 0.3, h) * (1.0 - smoothstep(0.3, 0.7, h));
+          col += uGlowColor * pow(sd, 6.0) * uGlow;
+          col += uDisc * pow(sd, 900.0) * 6.0;
+          // Faint banding to suggest high cloud (or an aurora).
+          float band = sin(d.y * uBandFreq + d.x * 3.0) * 0.5 + 0.5;
+          col += uBand * band * smoothstep(0.02, 0.3, h) * (1.0 - smoothstep(0.3, 0.7, h));
           gl_FragColor = vec4(col, 1.0);
         }
       `,
@@ -193,17 +348,21 @@ export class World {
     this.sky = new THREE.Mesh(geo, mat);
     this.sky.frustumCulled = false;
     this.sky.renderOrder = -1000;
-    this.scene.add(this.sky);
+    this._add(this.sky);
 
-    this.scene.fog = new THREE.Fog(0xd88f74, 340, 1150);
+    const fog = this.theme.fog;
+    this.scene.fog = new THREE.Fog(fog.color, fog.near, fog.far);
   }
 
   _buildLights() {
-    const hemi = new THREE.HemisphereLight(0xffc9a0, 0x3d3350, 1.05);
-    this.scene.add(hemi);
+    const t = this.theme;
+    this.sunDir = new THREE.Vector3(...t.sun.dir).normalize();
 
-    const sun = new THREE.DirectionalLight(0xffd7ab, 2.5);
-    sun.position.copy(SUN_DIRECTION).multiplyScalar(260);
+    const hemi = new THREE.HemisphereLight(t.hemi.sky, t.hemi.ground, t.hemi.intensity);
+    this._add(hemi);
+
+    const sun = new THREE.DirectionalLight(t.sun.color, t.sun.intensity);
+    sun.position.copy(this.sunDir).multiplyScalar(260);
     sun.castShadow = true;
     sun.shadow.mapSize.set(2048, 2048);
     const S = 105;
@@ -215,56 +374,51 @@ export class World {
     sun.shadow.camera.far = 620;
     sun.shadow.bias = -0.0012;
     sun.shadow.normalBias = 0.045;
-    this.scene.add(sun);
-    this.scene.add(sun.target);
+    this._add(sun);
+    this._add(sun.target);
     this.sun = sun;
 
-    // Cool bounce from the opposite side keeps shadowed bodywork readable.
-    const fill = new THREE.DirectionalLight(0x8fb4ff, 0.45);
+    // Bounce from the opposite side keeps shadowed bodywork readable.
+    const fill = new THREE.DirectionalLight(t.fill.color, t.fill.intensity);
     fill.position.set(120, 90, 180);
-    this.scene.add(fill);
+    this._add(fill);
   }
 
   /** Keeps the shadow frustum wrapped around the player. */
   focusShadows(target) {
     this.sun.target.position.copy(target);
-    this.sun.position.copy(target).addScaledVector(SUN_DIRECTION, 260);
+    this.sun.position.copy(target).addScaledVector(this.sunDir, 260);
     this.sun.target.updateMatrixWorld();
   }
 
   // --------------------------------------------------------------- terrain
 
   _buildTerrain() {
-    const geo = new THREE.PlaneGeometry(
-      TERRAIN_SIZE, TERRAIN_SIZE, TERRAIN_SEGMENTS, TERRAIN_SEGMENTS
-    );
+    const size = this.terrainSize;
+    const segments = this.terrainSegments;
+    const geo = new THREE.PlaneGeometry(size, size, segments, segments);
     geo.rotateX(-Math.PI / 2);
-
-    // Centre the sheet on the circuit.
-    const box = new THREE.Box3();
-    for (const p of this.track.positions) box.expandByPoint(p);
-    const centre = box.getCenter(new THREE.Vector3());
-    geo.translate(centre.x, 0, centre.z);
+    geo.translate(this.centre.x, 0, this.centre.z);
 
     const pos = geo.attributes.position;
     const heights = new Float32Array(pos.count);
     const colors = new Float32Array(pos.count * 3);
 
     for (let i = 0; i < pos.count; i++) {
-      const x = pos.getX(i);
-      const z = pos.getZ(i);
-      heights[i] = this._terrainHeight(x, z);
+      heights[i] = this._terrainHeight(pos.getX(i), pos.getZ(i));
       pos.setY(i, heights[i]);
     }
 
-    // Colour by height and slope.
-    const cols = TERRAIN_SEGMENTS + 1;
-    const step = TERRAIN_SIZE / TERRAIN_SEGMENTS;
-    const grass = new THREE.Color(0x4b7a3a);
-    const dryGrass = new THREE.Color(0x8a8f45);
-    const rock = new THREE.Color(0x6b5a4c);
-    const cliff = new THREE.Color(0x7d4f3c);
-    const sand = new THREE.Color(0xc8b184);
+    // Colour by height above the local landscape, and by slope.
+    const cols = this.terrainCols;
+    const step = this.terrainStep;
+    const t = this.theme.terrain;
+    const low = new THREE.Color(t.low);
+    const high = new THREE.Color(t.high);
+    const rock = new THREE.Color(t.rock);
+    const cliff = new THREE.Color(t.cliff);
+    const shore = new THREE.Color(t.shore);
+    const waterLevel = this.theme.water.level;
     const tmp = new THREE.Color();
 
     for (let i = 0; i < pos.count; i++) {
@@ -275,12 +429,14 @@ export class World {
       const hU = heights[Math.max(0, row - 1) * cols + col];
       const hD = heights[Math.min(cols - 1, row + 1) * cols + col];
       const slope = Math.min(1, ((Math.abs(hR - hL) + Math.abs(hD - hU)) / (4 * step)) * 1.5);
-      const h = heights[i];
+      // Relative height reads the same whether the course is at sea level or
+      // half way up a volcano.
+      const rel = heights[i] - this._regionalHeight(pos.getX(i), pos.getZ(i));
 
-      tmp.copy(grass).lerp(dryGrass, smoothstep(4, 34, h));
+      tmp.copy(low).lerp(high, smoothstep(t.lowBand[0], t.lowBand[1], rel));
       tmp.lerp(rock, smoothstep(0.32, 0.75, slope));
-      tmp.lerp(cliff, smoothstep(0.62, 0.95, slope) * smoothstep(-24, 6, h));
-      tmp.lerp(sand, smoothstep(-13, WATER_LEVEL + 1.5, h));
+      tmp.lerp(cliff, smoothstep(0.62, 0.95, slope) * smoothstep(-24, 6, rel));
+      tmp.lerp(shore, smoothstep(waterLevel + 7, waterLevel + 1.5, heights[i]));
       // Break up the flatness a little.
       const tint = 1 + valueNoise(pos.getX(i) * 0.06, pos.getZ(i) * 0.06) * 0.1;
       colors[i * 3] = tmp.r * tint;
@@ -300,43 +456,42 @@ export class World {
     const mesh = new THREE.Mesh(geo, mat);
     mesh.receiveShadow = true;
     mesh.name = 'terrain';
-    this.scene.add(mesh);
+    this._add(mesh);
 
     this.terrain = mesh;
     this.terrainHeights = heights;
-    this.terrainCentre = centre;
-    this.terrainCols = cols;
-    this.terrainStep = step;
   }
 
   _terrainHeight(x, z) {
+    const t = this.theme.terrain;
     const { dist, lowest } = this.grid.querySolid(x, z, ROAD_INFLUENCE);
+    const regional = this._regionalHeight(x, z);
 
     // Rolling hills that own everything far from the circuit.
     const base =
-      fbm(x * 0.0022, z * 0.0022) * 46 +
-      fbm(x * 0.0085, z * 0.0085) * 11 +
-      fbm(x * 0.03, z * 0.03) * 2.4 +
-      2;
+      regional +
+      fbm(x * 0.0022, z * 0.0022) * t.hills +
+      fbm(x * 0.0085, z * 0.0085) * t.hills * 0.24 +
+      fbm(x * 0.03, z * 0.03) * 2.4;
 
     let h = base;
     if (Number.isFinite(lowest)) {
       // 1 right beside the road, easing out to nothing at ROAD_INFLUENCE metres.
       const w = 1 - smoothstep(22, ROAD_INFLUENCE, dist);
-      const roadside = lowest - ROAD_CLEARANCE - smoothstep(0, 60, dist) * 5;
+      const roadside = lowest - t.clearance - smoothstep(0, 60, dist) * 5;
       h = base + (roadside - base) * w;
     }
 
     // Gouge the canyon beneath the glider gaps. The carve tapers off over the
     // last 30 m at each end of a gap so it never slices through the road deck.
-    const gap = this.grid.queryGap(x, z);
+    const gap = this.grid.queryGap(x, z, 150);
     if (gap.dist < 130) {
       const carve =
         smoothstep(130, 28, gap.dist) *
         smoothstep(0, 30, gap.fromEnd) *
         (1 - smoothstep(38, 18, dist));
       if (carve > 0.001) {
-        const floor = CANYON_FLOOR + fbm(x * 0.012, z * 0.012) * 6;
+        const floor = gap.height - t.canyonDepth + fbm(x * 0.012, z * 0.012) * 6;
         h += (Math.min(h, floor) - h) * carve;
       }
     }
@@ -345,9 +500,9 @@ export class World {
 
   /** Bilinear sample of the generated heightfield -- used to plant scenery. */
   heightAt(x, z) {
-    const half = TERRAIN_SIZE / 2;
-    const fx = (x - this.terrainCentre.x + half) / this.terrainStep;
-    const fz = (z - this.terrainCentre.z + half) / this.terrainStep;
+    const half = this.terrainSize / 2;
+    const fx = (x - this.centre.x + half) / this.terrainStep;
+    const fz = (z - this.centre.z + half) / this.terrainStep;
     const cols = this.terrainCols;
     if (fx < 0 || fz < 0 || fx >= cols - 1 || fz >= cols - 1) return null;
     const x0 = Math.floor(fx);
@@ -365,26 +520,30 @@ export class World {
   // ----------------------------------------------------------------- water
 
   _buildWater() {
-    const geo = new THREE.PlaneGeometry(5000, 5000, 1, 1);
+    const w = this.theme.water;
+    const geo = new THREE.PlaneGeometry(this.terrainSize * 3, this.terrainSize * 3, 1, 1);
     geo.rotateX(-Math.PI / 2);
-    const ripple = this._rippleTexture();
+    const ripple = this._rippleTexture(w.color);
     const mat = new THREE.MeshStandardMaterial({
-      color: 0x2a6f8f,
-      roughness: 0.18,
-      metalness: 0.55,
-      transparent: true,
-      opacity: 0.9,
+      color: w.color,
+      roughness: w.roughness,
+      metalness: w.metalness,
+      transparent: w.opacity < 1,
+      opacity: w.opacity,
       map: ripple,
+      emissive: new THREE.Color(w.emissive ?? 0x000000),
+      emissiveIntensity: w.emissiveIntensity ?? 0,
     });
     const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.set(this.terrainCentre.x, WATER_LEVEL, this.terrainCentre.z);
+    mesh.position.set(this.centre.x, w.level, this.centre.z);
     mesh.name = 'water';
-    this.scene.add(mesh);
+    this._add(mesh);
     this.water = mesh;
     this.waterTex = ripple;
   }
 
-  _rippleTexture() {
+  _rippleTexture(tint) {
+    const c = new THREE.Color(tint);
     const canvas = document.createElement('canvas');
     canvas.width = canvas.height = 256;
     const ctx = canvas.getContext('2d');
@@ -392,11 +551,11 @@ export class World {
     for (let y = 0; y < 256; y++) {
       for (let x = 0; x < 256; x++) {
         const n = fbm(x * 0.05, y * 0.05) * 0.5 + 0.5;
-        const v = 120 + n * 90;
+        const v = 140 + n * 115;
         const i = (y * 256 + x) * 4;
-        img.data[i] = v * 0.35;
-        img.data[i + 1] = v * 0.75;
-        img.data[i + 2] = v;
+        img.data[i] = v * (0.45 + c.r * 0.6);
+        img.data[i + 1] = v * (0.45 + c.g * 0.6);
+        img.data[i + 2] = v * (0.45 + c.b * 0.6);
         img.data[i + 3] = 255;
       }
     }
@@ -408,23 +567,72 @@ export class World {
     return tex;
   }
 
+  /**
+   * A river / lava flow / frozen floor sitting in the bottom of each carved gap,
+   * so a glider crossing has something to fly over besides a hole.
+   */
+  _buildChasms() {
+    const spec = this.theme.chasm;
+    if (!spec) return;
+    const group = new THREE.Group();
+    group.name = 'chasms';
+    const mat = new THREE.MeshStandardMaterial({
+      color: spec.color,
+      emissive: new THREE.Color(spec.emissive ?? 0x000000),
+      emissiveIntensity: spec.emissiveIntensity ?? 0,
+      roughness: 0.5,
+      metalness: 0.1,
+    });
+
+    for (const gap of this.track.gaps) {
+      const a = this.track.frameAt(gap.start);
+      const start = a.position.clone();
+      const b = this.track.frameAt(gap.end);
+      const end = b.position.clone();
+      const mid = start.clone().add(end).multiplyScalar(0.5);
+      const len = start.distanceTo(end) + 60;
+      const geo = new THREE.PlaneGeometry(110, len, 1, 1);
+      geo.rotateX(-Math.PI / 2);
+      const plate = new THREE.Mesh(geo, mat);
+      const drop = this.theme.terrain.canyonDepth * (spec.drop ?? 0.6);
+      plate.position.set(mid.x, Math.min(start.y, end.y) - drop, mid.z);
+      plate.rotation.y = Math.atan2(end.x - start.x, end.z - start.z);
+      group.add(plate);
+    }
+    this._add(group);
+  }
+
   // --------------------------------------------------------------- scenery
 
   _buildScenery() {
-    const trunkGeo = new THREE.CylinderGeometry(0.32, 0.52, 3.4, 5);
-    trunkGeo.translate(0, 1.7, 0);
-    const leafGeo = new THREE.ConeGeometry(2.5, 7.2, 7);
-    leafGeo.translate(0, 6.4, 0);
-    const rockGeo = new THREE.DodecahedronGeometry(1.9, 0);
+    const spec = this.theme.scenery;
+    const scale = spec.scale ?? 1;
+    const trunkGeo = new THREE.CylinderGeometry(
+      spec.trunk.top, spec.trunk.bottom, spec.trunk.height, 5
+    );
+    trunkGeo.translate(0, spec.trunk.height / 2, 0);
+    const foliageGeos = spec.foliage.map((f) =>
+      f.kind === 'sphere'
+        ? new THREE.IcosahedronGeometry(f.radius, 0).translate(0, f.y + f.radius, 0)
+        : new THREE.ConeGeometry(f.radius, f.height, 7).translate(0, f.y + f.height / 2, 0)
+    );
+    const rockGeo = new THREE.DodecahedronGeometry(spec.rock.radius, 0);
 
-    const trunkMat = new THREE.MeshStandardMaterial({ color: 0x5a3f2b, roughness: 1, flatShading: true });
-    const leafMat = new THREE.MeshStandardMaterial({ color: 0x2f6b34, roughness: 0.95, flatShading: true });
-    const rockMat = new THREE.MeshStandardMaterial({ color: 0x6e6257, roughness: 1, flatShading: true });
+    const trunkMat = new THREE.MeshStandardMaterial({
+      color: spec.trunk.color, roughness: 1, flatShading: true,
+    });
+    const foliageMats = spec.foliage.map((f) => new THREE.MeshStandardMaterial({
+      color: f.color, roughness: 0.95, flatShading: true,
+    }));
+    const rockMat = new THREE.MeshStandardMaterial({
+      color: spec.rock.color, roughness: 1, flatShading: true,
+    });
 
     const trees = [];
     const rocks = [];
     const dummy = new THREE.Object3D();
     const track = this.track;
+    const waterLevel = this.theme.water.level;
 
     let seed = 1337;
     const rnd = () => {
@@ -436,7 +644,7 @@ export class World {
       const frame = track.frameAt(s);
       for (const side of [-1, 1]) {
         for (let k = 0; k < 3; k++) {
-          if (rnd() > 0.42) continue;
+          if (rnd() > spec.density) continue;
           const lateral = side * (frame.halfWidth + 14 + rnd() * 62);
           const jitter = (rnd() - 0.5) * 8;
           const px = frame.position.x + frame.right.x * lateral + frame.tangent.x * jitter;
@@ -447,21 +655,21 @@ export class World {
           if (near.dist < 19) continue;
 
           const gy = this.heightAt(px, pz);
-          if (gy === null || gy < WATER_LEVEL + 1.5) continue;
+          if (gy === null || gy < waterLevel + 1.5) continue;
 
           const slope = this._slopeAt(px, pz);
-          if (rnd() < 0.24 || slope > 0.55) {
-            const scale = 0.5 + rnd() * 1.5;
-            dummy.position.set(px, gy - 0.5 * scale, pz);
+          if (rnd() < spec.rockChance || slope > 0.55) {
+            const size = 0.5 + rnd() * 1.5;
+            dummy.position.set(px, gy - 0.5 * size, pz);
             dummy.rotation.set(rnd() * 3, rnd() * 6, rnd() * 3);
-            dummy.scale.setScalar(scale);
+            dummy.scale.setScalar(size);
             dummy.updateMatrix();
             rocks.push(dummy.matrix.clone());
           } else {
-            const scale = 0.7 + rnd() * 0.85;
+            const size = (0.7 + rnd() * 0.85) * scale;
             dummy.position.set(px, gy - 0.3, pz);
             dummy.rotation.set(0, rnd() * 6.28, 0);
-            dummy.scale.set(scale, scale * (0.8 + rnd() * 0.55), scale);
+            dummy.scale.set(size, size * (0.8 + rnd() * 0.55), size);
             dummy.updateMatrix();
             trees.push(dummy.matrix.clone());
           }
@@ -477,10 +685,10 @@ export class World {
       mesh.castShadow = shadow;
       mesh.receiveShadow = true;
       mesh.name = name;
-      this.scene.add(mesh);
+      this._add(mesh);
     };
     addInstanced(trunkGeo, trunkMat, trees, 'treeTrunks');
-    addInstanced(leafGeo, leafMat, trees, 'treeLeaves');
+    foliageGeos.forEach((geo, i) => addInstanced(geo, foliageMats[i], trees, `treeFoliage${i}`));
     addInstanced(rockGeo, rockMat, rocks, 'rocks');
 
     this.sceneryCounts = { trees: trees.length, rocks: rocks.length };
@@ -500,10 +708,11 @@ export class World {
 
   /** Concrete columns wherever the deck floats well above the ground. */
   _buildPylons() {
-    const group = new THREE.Group();
-    group.name = 'pylons';
     const mat = new THREE.MeshStandardMaterial({ color: 0x8d8d96, roughness: 0.9 });
+    const geo = new THREE.CylinderGeometry(1.15, 1.7, 1, 8);
     const track = this.track;
+    const dummy = new THREE.Object3D();
+    const slots = [];
 
     for (let s = 0; s < track.length; s += 16) {
       if (track.inGap(s)) continue;
@@ -515,23 +724,107 @@ export class World {
       if (drop < 5) continue;
 
       for (const side of [-0.55, 0.55]) {
-        const geo = new THREE.CylinderGeometry(1.15, 1.7, drop, 8);
-        const pylon = new THREE.Mesh(geo, mat);
-        pylon.position
+        dummy.position
           .copy(frame.position)
           .addScaledVector(frame.right, side * frame.halfWidth)
           .setY(gy + drop / 2);
-        pylon.castShadow = true;
-        pylon.receiveShadow = true;
-        group.add(pylon);
+        dummy.rotation.set(0, 0, 0);
+        dummy.scale.set(1, drop, 1);
+        dummy.updateMatrix();
+        slots.push(dummy.matrix.clone());
       }
     }
-    this.scene.add(group);
-    this.pylons = group;
+    if (!slots.length) return;
+
+    const mesh = new THREE.InstancedMesh(geo, mat, slots.length);
+    slots.forEach((m, i) => mesh.setMatrixAt(i, m));
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    mesh.name = 'pylons';
+    this._add(mesh);
   }
 
-  update(dt, elapsed) {
+  // -------------------------------------------------------------- weather
+
+  /**
+   * Snow, drifting leaves or rising embers. The particles live in world space
+   * and are wrapped into a box around the camera, so they stream past properly
+   * instead of hanging off the windscreen.
+   */
+  _buildAmbient() {
+    const spec = this.theme.ambient;
+    if (!spec) return;
+    const count = spec.count;
+    const positions = new Float32Array(count * 3);
+    const speeds = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
+      positions[i * 3] = (Math.random() - 0.5) * AMBIENT_BOX * 2;
+      positions[i * 3 + 1] = (Math.random() - 0.5) * AMBIENT_BOX * 2;
+      positions[i * 3 + 2] = (Math.random() - 0.5) * AMBIENT_BOX * 2;
+      speeds[i] = 0.6 + Math.random() * 0.8;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    const mat = new THREE.PointsMaterial({
+      color: spec.color,
+      size: spec.size,
+      map: TX.sparkTexture(),
+      transparent: true,
+      depthWrite: false,
+      sizeAttenuation: true,
+      blending: spec.kind === 'ember' ? THREE.AdditiveBlending : THREE.NormalBlending,
+      opacity: spec.kind === 'ember' ? 0.9 : 0.75,
+    });
+    const points = new THREE.Points(geo, mat);
+    points.frustumCulled = false;
+    points.name = 'weather';
+    this._add(points);
+    this.ambient = { points, positions, speeds, spec, geo };
+  }
+
+  _updateAmbient(dt, elapsed, camera) {
+    const a = this.ambient;
+    if (!a || !camera) return;
+    const { positions, speeds, spec } = a;
+    const cam = camera.position;
+    const B = AMBIENT_BOX;
+    for (let i = 0; i < speeds.length; i++) {
+      const i3 = i * 3;
+      positions[i3 + 1] -= spec.fall * speeds[i] * dt;
+      positions[i3] += Math.sin(elapsed * 0.7 + i) * spec.drift * dt;
+      positions[i3 + 2] += Math.cos(elapsed * 0.6 + i * 1.3) * spec.drift * dt;
+      // Wrap into the box that follows the camera.
+      for (let axis = 0; axis < 3; axis++) {
+        const centre = axis === 0 ? cam.x : axis === 1 ? cam.y : cam.z;
+        let d = positions[i3 + axis] - centre;
+        if (d > B) positions[i3 + axis] -= B * 2;
+        else if (d < -B) positions[i3 + axis] += B * 2;
+      }
+    }
+    a.geo.attributes.position.needsUpdate = true;
+  }
+
+  update(dt, elapsed, camera) {
     this.waterTex.offset.x = elapsed * 0.004;
     this.waterTex.offset.y = elapsed * 0.0026;
+    this._updateAmbient(dt, elapsed, camera);
+  }
+
+  dispose() {
+    for (const object of this.objects) {
+      this.scene.remove(object);
+      object.traverse?.((node) => {
+        node.geometry?.dispose?.();
+        const mat = node.material;
+        if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+        else mat?.dispose?.();
+      });
+    }
+    this.objects.length = 0;
+    // The ripple map is generated per world; the shared texture cache owns
+    // everything else, so this is the only one we are allowed to release.
+    this.waterTex?.dispose();
+    this.scene.fog = null;
   }
 }

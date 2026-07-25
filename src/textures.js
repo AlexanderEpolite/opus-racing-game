@@ -3,6 +3,11 @@ import * as THREE from 'three';
 /**
  * Every texture in the game is drawn procedurally into a canvas at load time --
  * that keeps the project to zero binary assets and zero network requests.
+ *
+ * The surface textures take their palette from the loaded track's theme, so the
+ * same drawing code produces sun-baked asphalt, packed snow or cracked basalt.
+ * Results are cached per theme key: switching back to a circuit you have already
+ * visited costs nothing.
  */
 
 const cache = new Map();
@@ -36,12 +41,13 @@ function noise(ctx, w, h, amount, alpha) {
   ctx.putImageData(img, 0, 0);
 }
 
-/** Asphalt with painted edge lines and a dashed centre stripe. */
-export function roadTexture() {
-  return make('road', 256, 256, (ctx, w, h) => {
-    ctx.fillStyle = '#3a3a42';
+/** Road surface with painted edge lines, a dashed centre stripe and theme grime. */
+export function roadTexture(theme) {
+  const r = theme.road;
+  return make(`road:${theme.key}`, 256, 256, (ctx, w, h) => {
+    ctx.fillStyle = r.asphalt;
     ctx.fillRect(0, 0, w, h);
-    noise(ctx, w, h, 34);
+    noise(ctx, w, h, r.noise ?? 34);
 
     // Subtle darker wheel tracks where karts actually drive.
     const grad = ctx.createLinearGradient(0, 0, w, 0);
@@ -53,37 +59,81 @@ export function roadTexture() {
     ctx.fillStyle = grad;
     ctx.fillRect(0, 0, w, h);
 
+    // Per-theme surface character.
+    if (r.frost) {
+      ctx.globalAlpha = 0.5;
+      for (let i = 0; i < 26; i++) {
+        ctx.fillStyle = i % 2 ? 'rgba(226,242,255,0.55)' : 'rgba(160,196,220,0.45)';
+        const x = Math.random() * w;
+        const y = Math.random() * h;
+        ctx.beginPath();
+        ctx.ellipse(x, y, 6 + Math.random() * 26, 3 + Math.random() * 9, Math.random(), 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+    if (r.moss) {
+      ctx.globalAlpha = 0.32;
+      for (let i = 0; i < 34; i++) {
+        ctx.fillStyle = Math.random() > 0.5 ? '#4c6b3f' : '#3d5a30';
+        ctx.beginPath();
+        ctx.arc(Math.random() * w, Math.random() * h, 3 + Math.random() * 11, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+    if (r.cracks) {
+      ctx.strokeStyle = r.cracks;
+      ctx.globalAlpha = 0.5;
+      for (let i = 0; i < 9; i++) {
+        ctx.lineWidth = 0.7 + Math.random() * 1.6;
+        ctx.beginPath();
+        let x = Math.random() * w;
+        let y = Math.random() * h;
+        ctx.moveTo(x, y);
+        for (let k = 0; k < 5; k++) {
+          x += (Math.random() - 0.5) * 40;
+          y += (Math.random() - 0.5) * 60;
+          ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+
     // Solid edge lines.
-    ctx.fillStyle = '#e8e8ee';
+    ctx.fillStyle = r.line;
     ctx.fillRect(w * 0.035, 0, w * 0.022, h);
     ctx.fillRect(w * 0.943, 0, w * 0.022, h);
 
     // Dashed centre line (the texture's vertical axis runs along the track).
-    ctx.fillStyle = 'rgba(232,232,238,0.75)';
+    ctx.fillStyle = r.centre;
     ctx.fillRect(w * 0.492, h * 0.08, w * 0.016, h * 0.42);
   });
 }
 
-/** Red/white kerbing. */
-export function kerbTexture() {
-  return make('kerb', 32, 64, (ctx, w, h) => {
+/** Two-tone kerbing. */
+export function kerbTexture(theme) {
+  const k = theme.kerb;
+  return make(`kerb:${theme.key}`, 32, 64, (ctx, w, h) => {
     for (let i = 0; i < 4; i++) {
-      ctx.fillStyle = i % 2 ? '#e5e5ea' : '#d8354a';
+      ctx.fillStyle = i % 2 ? k.b : k.a;
       ctx.fillRect(0, (i * h) / 4, w, h / 4);
     }
     noise(ctx, w, h, 16);
   });
 }
 
-/** Packed dirt run-off. */
-export function shoulderTexture() {
-  return make('shoulder', 128, 128, (ctx, w, h) => {
-    ctx.fillStyle = '#6b5638';
+/** Run-off beside the road: dirt, snow or ash depending on the theme. */
+export function shoulderTexture(theme) {
+  const s = theme.shoulder;
+  return make(`shoulder:${theme.key}`, 128, 128, (ctx, w, h) => {
+    ctx.fillStyle = s.base;
     ctx.fillRect(0, 0, w, h);
-    noise(ctx, w, h, 46);
+    noise(ctx, w, h, s.noise ?? 46);
     ctx.globalAlpha = 0.25;
     for (let i = 0; i < 60; i++) {
-      ctx.fillStyle = Math.random() > 0.5 ? '#8a7350' : '#4e3d26';
+      ctx.fillStyle = Math.random() > 0.5 ? s.speckA : s.speckB;
       const r = 2 + Math.random() * 7;
       ctx.beginPath();
       ctx.arc(Math.random() * w, Math.random() * h, r, 0, Math.PI * 2);
@@ -167,10 +217,11 @@ export function sparkTexture() {
 }
 
 /** Advertising hoardings that line the circuit. */
-export function bannerTexture() {
-  return make('banner', 1024, 128, (ctx, w, h) => {
-    const words = ['SUNSET RIDGE', 'TURBO CELL', 'APEX TYRES', 'NITRO CO'];
-    const colors = ['#1d2b53', '#7b2d5e', '#0d5c63', '#8a3324'];
+export function bannerTexture(theme) {
+  const b = theme.banner;
+  return make(`banner:${theme.key}`, 1024, 128, (ctx, w, h) => {
+    const words = b.words;
+    const colors = b.colors;
     const slice = w / words.length;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
@@ -180,7 +231,7 @@ export function bannerTexture() {
       ctx.rect(i * slice, 0, slice, h);
       ctx.clip();
 
-      ctx.fillStyle = colors[i];
+      ctx.fillStyle = colors[i % colors.length];
       ctx.fillRect(i * slice, 0, slice, h);
       ctx.fillStyle = 'rgba(255,255,255,0.08)';
       ctx.fillRect(i * slice, 0, slice, h * 0.42);
